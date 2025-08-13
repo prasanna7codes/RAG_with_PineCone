@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Environment
+.env
+
+# ChromaDB persistence
+vector_store/
+
+# VSCode
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+
+safe.txt
+NIPS-2017-attention-is-all-you-need-Paper.pdf
