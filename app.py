@@ -1,5 +1,6 @@
 import os
 import shutil
+import uuid
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -10,9 +11,9 @@ from llama_parse import LlamaParse
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
+from pinecone import Pinecone
 
 load_dotenv()
 
@@ -20,15 +21,19 @@ load_dotenv()
 FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-CHROMA_DB_DIR = "./vector_store"
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+INDEX_NAME = "client-data"
+
+# ================= INIT PINECONE =================
+pc = Pinecone(api_key=PINECONE_API_KEY)
+index = pc.Index(INDEX_NAME)
 
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot Demo")
 
-# Enable CORS for Postman / frontend testing
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,6 +47,7 @@ class QueryJSON(BaseModel):
 # ================= FUNCTIONS =================
 def crawl_website(url: str):
     app_fc = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
+    print("starting crawling")
     crawl_status = app_fc.crawl_url(
         url,
         limit=10,
@@ -53,7 +59,7 @@ def crawl_website(url: str):
         if hasattr(page, "markdown") and page.markdown.strip():
             docs.append(Document(
                 page_content=page.markdown,
-                metadata={"source": page.url}
+                metadata={"source": page.url or ""}
             ))
     return docs
 
@@ -64,36 +70,54 @@ def parse_pdf(pdf_file: UploadFile):
     parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
     parsed = parser.load_data(temp_path)
     os.remove(temp_path)
-    docs = [Document(page_content=d.text, metadata={"source": pdf_file.filename}) for d in parsed]
+    docs = [
+        Document(
+            page_content=d.text,
+            metadata={"source": pdf_file.filename or ""}
+        ) for d in parsed
+    ]
     return docs
 
 def chunk_documents(documents):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(documents)
-    return chunks
+    return splitter.split_documents(documents)
 
-def store_in_chroma(chunks, client_id: str):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    db = Chroma(
-        collection_name=client_id,
-        embedding_function=embeddings,
-        persist_directory=CHROMA_DB_DIR
-    )
-    db.add_documents(chunks)
-    return db
+def store_in_pinecone(chunks, client_id: str):
+    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    vectors = []
+    for chunk in chunks:
+        vector_id = str(uuid.uuid4())
+        embedding = embeddings_model.embed_query(chunk.page_content)
+        vectors.append((
+            vector_id,
+            embedding,
+            {
+                "client_id": client_id,
+                "source": str(chunk.metadata.get("source") or ""),
+                "content": chunk.page_content
+            }
+        ))
+    # Upsert into Pinecone with namespace = client_id
+    index.upsert(vectors, namespace=client_id)
+    return len(vectors)
 
 def chatbot_query(client_id: str, question: str):
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    db = Chroma(
-        collection_name=client_id,
-        embedding_function=embeddings,
-        persist_directory=CHROMA_DB_DIR
+    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    query_embedding = embeddings_model.embed_query(question)
+
+    results = index.query(
+        vector=query_embedding,
+        top_k=3,
+        include_metadata=True,
+        filter={"client_id": {"$eq": client_id}},
+        namespace=client_id  # Query only this client's namespace
     )
-    retriever = db.as_retriever(search_kwargs={"k": 3})
-    relevant_docs = retriever.get_relevant_documents(question)
-    if not relevant_docs:
+
+    if not results.matches:
         return "No relevant data found for this client."
-    context = "\n\n".join([doc.page_content for doc in relevant_docs])
+
+    context = "\n\n".join([match.metadata.get("content", "") for match in results.matches])
+
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
     prompt = f"""Answer the following question using only the provided context.
 Context:
@@ -106,16 +130,10 @@ Question: {question}
 # ================= API ROUTES =================
 @app.post("/ingest/")
 async def ingest_data(
-    client_id: str = Form(...),       # required
-    url: Optional[str] = Form(None),  # optional
-    pdf: Optional[UploadFile] = File(None)  # optional
+    client_id: str = Form(...),
+    url: Optional[str] = Form(None),
+    pdf: Optional[UploadFile] = File(None)
 ):
-    """
-    Accepts form-data:
-    - client_id (required)
-    - url (optional)
-    - pdf (optional)
-    """
     all_docs = []
 
     if url:
@@ -130,9 +148,9 @@ async def ingest_data(
         return JSONResponse({"error": "No URL or PDF provided"}, status_code=400)
 
     chunks = chunk_documents(all_docs)
-    store_in_chroma(chunks, client_id)
+    vectors_count = store_in_pinecone(chunks, client_id)
 
-    return {"message": f"Data ingested for client {client_id}", "chunks_count": len(chunks)}
+    return {"message": f"Data ingested for client {client_id}", "chunks_count": vectors_count}
 
 @app.post("/query/")
 async def query_chatbot_endpoint(json_data: QueryJSON):
