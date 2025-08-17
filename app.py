@@ -12,8 +12,7 @@ from firecrawl import FirecrawlApp, ScrapeOptions
 from llama_parse import LlamaParse
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from dotenv import load_dotenv
 from pinecone import Pinecone
 from supabase import create_client, Client
@@ -27,30 +26,19 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-INDEX_NAME = "client-data"
+# MODIFIED: Updated to your new index name
+INDEX_NAME = "client-data-2"
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# NEW: Create a global variable to hold the pre-loaded model
-embeddings_model = None
+# Initialize the Google Embeddings client. This uses an API and is very lightweight.
+embeddings_model = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=GEMINI_API_KEY)
 
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot Demo")
-
-# NEW: Add a startup event to pre-load the model
-@app.on_event("startup")
-async def startup_event():
-    """
-    Load the embedding model on application startup to avoid timeouts
-    on the first request.
-    """
-    global embeddings_model
-    print("--> Pre-loading embedding model...")
-    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    print("--> Embedding model pre-loaded successfully.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -69,10 +57,8 @@ class QueryJSON(BaseModel):
 
 # ================= SECURITY DEPENDENCY =================
 async def get_client_id_from_key(x_api_key: str = Header(None)):
-    """Dependency to verify API key and return the client_id (user's UUID)"""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
-
     response = (
         supabase.table("users_extra")
         .select("id")
@@ -80,10 +66,8 @@ async def get_client_id_from_key(x_api_key: str = Header(None)):
         .single()
         .execute()
     )
-
     if not response.data:
         raise HTTPException(status_code=403, detail="Invalid API Key provided")
-
     client_id = response.data.get("id")
     return client_id
 
@@ -118,7 +102,6 @@ def chunk_documents(documents):
     return splitter.split_documents(documents)
 
 def store_in_pinecone(chunks, client_id: str):
-    # MODIFIED: Uses the pre-loaded global 'embeddings_model'
     vectors = []
     for chunk in chunks:
         vector_id = str(uuid.uuid4())
@@ -138,7 +121,6 @@ def store_in_pinecone(chunks, client_id: str):
     return len(vectors)
 
 def chatbot_query(client_id: str, question: str):
-    # MODIFIED: Uses the pre-loaded global 'embeddings_model'
     query_embedding = embeddings_model.embed_query(question)
     results = index.query(
         vector=query_embedding, top_k=3, include_metadata=True, namespace=client_id
