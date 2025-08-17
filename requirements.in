@@ -3,6 +3,8 @@ fastapi
 uvicorn
 python-dotenv
 pinecone
+langchain-core
+langchain-text-splitters
 langchain-google-genai
 langchain-huggingface
 llama-parse
