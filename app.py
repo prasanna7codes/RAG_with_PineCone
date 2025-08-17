@@ -16,7 +16,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 from dotenv import load_dotenv
 from pinecone import Pinecone
-from supabase import create_client, Client  # MODIFIED: Import Supabase
+from supabase import create_client, Client
 
 load_dotenv()
 
@@ -25,42 +25,54 @@ FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
 LLAMA_API_KEY = os.getenv("LLAMA_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")  # ADDED
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # ADDED
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 INDEX_NAME = "client-data"
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(INDEX_NAME)
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)  # ADDED: Init Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# NEW: Create a global variable to hold the pre-loaded model
+embeddings_model = None
 
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot Demo")
 
+# NEW: Add a startup event to pre-load the model
+@app.on_event("startup")
+async def startup_event():
+    """
+    Load the embedding model on application startup to avoid timeouts
+    on the first request.
+    """
+    global embeddings_model
+    print("--> Pre-loading embedding model...")
+    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    print("--> Embedding model pre-loaded successfully.")
+
 app.add_middleware(
     CORSMiddleware,
-    # IMPORTANT: In production, you should restrict this to your frontend domain
-    # and potentially a wildcard for your client's domains.
-    allow_origins=["https://rag-chatbot-frontend-orcin.vercel.app",
-                   "http://localhost:5173"],
+    allow_origins=[
+        "https://rag-chatbot-frontend-orcin.vercel.app",  # Production frontend
+        "http://localhost:5173"                           # Local development
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ================= Pydantic Models =================
-# MODIFIED: The client no longer sends their ID.
 class QueryJSON(BaseModel):
     question: str
 
-
-# ================= SECURITY DEPENDENCY (NEW) =================
+# ================= SECURITY DEPENDENCY =================
 async def get_client_id_from_key(x_api_key: str = Header(None)):
     """Dependency to verify API key and return the client_id (user's UUID)"""
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
 
-    # Query Supabase to find the user with this public_api_key
     response = (
         supabase.table("users_extra")
         .select("id")
@@ -75,7 +87,6 @@ async def get_client_id_from_key(x_api_key: str = Header(None)):
     client_id = response.data.get("id")
     return client_id
 
-
 # ================= FUNCTIONS =================
 def crawl_website(url: str):
     app_fc = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
@@ -88,7 +99,6 @@ def crawl_website(url: str):
         if hasattr(page, "markdown") and page.markdown.strip()
     ]
     return docs
-
 
 def parse_pdf(pdf_file: UploadFile):
     temp_path = f"./temp_{pdf_file.filename}"
@@ -103,14 +113,12 @@ def parse_pdf(pdf_file: UploadFile):
     ]
     return docs
 
-
 def chunk_documents(documents):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     return splitter.split_documents(documents)
 
-
 def store_in_pinecone(chunks, client_id: str):
-    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # MODIFIED: Uses the pre-loaded global 'embeddings_model'
     vectors = []
     for chunk in chunks:
         vector_id = str(uuid.uuid4())
@@ -129,9 +137,8 @@ def store_in_pinecone(chunks, client_id: str):
     index.upsert(vectors, namespace=client_id)
     return len(vectors)
 
-
 def chatbot_query(client_id: str, question: str):
-    embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    # MODIFIED: Uses the pre-loaded global 'embeddings_model'
     query_embedding = embeddings_model.embed_query(question)
     results = index.query(
         vector=query_embedding, top_k=3, include_metadata=True, namespace=client_id
@@ -145,7 +152,6 @@ def chatbot_query(client_id: str, question: str):
     prompt = f"Answer the following question using only the provided context.\n\nContext:\n{context}\n\nQuestion: {question}"
     answer = llm.invoke(prompt)
     return answer.content
-
 
 # ================= API ROUTES =================
 @app.post("/ingest/")
@@ -163,19 +169,13 @@ async def ingest_data(
     vectors_count = store_in_pinecone(chunks, client_id)
     return {"message": f"Data ingested for client {client_id}", "chunks_count": vectors_count}
 
-
 @app.post("/query/")
 async def query_chatbot_endpoint(
     json_data: QueryJSON, client_id: str = Depends(get_client_id_from_key)
 ):
-    """
-    MODIFIED: This endpoint is now protected.
-    It requires a valid X-API-Key header.
-    The client_id is securely retrieved based on the key, not from the request body.
-    """
     try:
         answer = chatbot_query(client_id, json_data.question)
         return {"answer": answer}
     except Exception as e:
-        print(f"An error occurred during query: {e}")  # Better logging
+        print(f"An error occurred during query: {e}")
         return JSONResponse({"error": "An internal server error occurred."}, status_code=500)
