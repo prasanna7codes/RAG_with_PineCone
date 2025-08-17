@@ -1,0 +1,10 @@
+# requirements.in
+fastapi
+uvicorn
+python-dotenv
+pinecone
+langchain-google-genai
+langchain-huggingface
+llama-parse
+firecrawl-py
+supabase
