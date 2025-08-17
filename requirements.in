@@ -11,3 +11,5 @@ firecrawl-py
 supabase
 python-multipart
 sentence-transformers
+ celery 
+ redis
