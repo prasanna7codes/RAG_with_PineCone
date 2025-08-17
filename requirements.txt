@@ -259,6 +259,8 @@ python-dotenv==1.1.1
     #   -r requirements.in
     #   firecrawl-py
     #   llama-cloud-services
+python-multipart==0.0.20
+    # via -r requirements.in
 pyyaml==6.0.2
     # via
     #   huggingface-hub
