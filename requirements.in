@@ -10,3 +10,4 @@ llama-parse
 firecrawl-py
 supabase
 python-multipart
+sentence-transformers
