@@ -99,7 +99,7 @@ opentelemetry-sdk==1.36.0
 opentelemetry-semantic-conventions==0.57b0
 orjson==3.11.2
 overrides==7.7.0
-packaging==25.0
+
 pillow==11.3.0
 pinecone==7.3.0
 pinecone-plugin-assistant==1.7.0
