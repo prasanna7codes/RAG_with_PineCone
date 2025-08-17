@@ -41,7 +41,8 @@ app.add_middleware(
     CORSMiddleware,
     # IMPORTANT: In production, you should restrict this to your frontend domain
     # and potentially a wildcard for your client's domains.
-    allow_origins=["*"],
+    allow_origins=["https://rag-chatbot-frontend-orcin.vercel.app/",
+                   "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
