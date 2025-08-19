@@ -1,4 +1,3 @@
-
 import os
 import shutil
 import uuid
@@ -43,11 +42,12 @@ llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot Demo")
 
-# ⚠️ IMPORTANT: Do NOT allow "*" in production
-# We’ll validate Origin ourselves inside get_client_id_from_key
+# ⚠️ IMPORTANT: Do NOT leave "*" in production
+# - Dev: allow_origins=["*"] is fine
+# - Prod: use your frontend domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # This just allows preflight to go through
+    allow_origins=["*"],   # Change this to ["https://yourfrontend.com"] in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,25 +58,27 @@ class QueryJSON(BaseModel):
     question: str
 
 # ================= HELPERS =================
-def normalize_domain(url: str) -> str:
+def normalize_domain(url: str) -> Optional[str]:
     """
     Normalize URLs to plain domain (example.com).
-    Removes scheme, paths, etc.
+    Removes scheme, paths, www, etc.
     """
     if not url:
         return None
     parsed = urlparse(url if "://" in url else f"https://{url}")
-    return parsed.hostname.lower() if parsed.hostname else url.lower()
+    hostname = parsed.hostname.lower() if parsed.hostname else url.lower()
+    # Drop leading "www."
+    return hostname[4:] if hostname.startswith("www.") else hostname
 
 # ================= SECURITY =================
 async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
 
-    # 1. Lookup client by apiKey
+    # Lookup client by API key
     response = (
         supabase.table("users_extra")
-        .select("id, company_url")
+        .select("id, allowed_origins")
         .eq("public_api_key", x_api_key)
         .single()
         .execute()
@@ -86,23 +88,28 @@ async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)
         raise HTTPException(status_code=403, detail="Invalid API Key provided")
 
     client_id = response.data.get("id")
-    allowed_url = response.data.get("company_url")
+    allowed_origins = response.data.get("allowed_origins") or []
 
-    # 2. Normalize allowed domain
-    allowed_domain = normalize_domain(allowed_url)
-    print(allowed_domain)
-
-    # 3. Extract origin/referer from request headers
+    # Get origin/referer header
     origin = request.headers.get("origin") or request.headers.get("referer")
     if not origin:
         raise HTTPException(status_code=403, detail="Missing Origin header")
 
-    print(origin)
-    origin_domain = normalize_domain(origin)
-    print(origin_domain)
+    parsed_origin = urlparse(origin)
+    origin_domain = parsed_origin.hostname.lower() if parsed_origin.hostname else origin.lower()
 
-    # 4. Compare
-    if origin_domain != allowed_domain:
+    # Remove www. prefix
+    if origin_domain.startswith("www."):
+        origin_domain = origin_domain[4:]
+
+    # Check allowed origins
+    normalized_allowed = [d.lower().lstrip("www.") for d in allowed_origins]
+
+    # ✅ Special handling: allow any localhost port
+    if origin_domain == "localhost":
+        return client_id
+
+    if origin_domain not in normalized_allowed:
         raise HTTPException(status_code=403, detail=f"Unauthorized origin: {origin_domain}")
 
     return client_id
@@ -110,7 +117,6 @@ async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)
 # ================= FUNCTIONS =================
 def crawl_website(url: str):
     app_fc = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
-    print("starting_crawling")
     crawl_status = app_fc.crawl_url(
         url,
         limit=10,
@@ -175,7 +181,6 @@ def chatbot_query(client_id: str, question: str):
     if not results.matches:
         return "I'm sorry, I couldn't find any relevant information."
 
-    # ✅ Full context (no trimming)
     context = "\n\n".join([match.metadata.get("content", "") for match in results.matches])
 
     prompt = (
