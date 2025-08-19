@@ -12,8 +12,7 @@ from fastapi.responses import JSONResponse
 from firecrawl import FirecrawlApp, ScrapeOptions
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from llama_parse import LlamaParse
 from pinecone import Pinecone
 from pydantic import BaseModel
@@ -28,7 +27,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-INDEX_NAME = "client-data"
+INDEX_NAME = "clinet-data-google"
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -36,7 +35,8 @@ index = pc.Index(INDEX_NAME)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ================= GLOBAL MODELS =================
-embeddings_model = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Use Google's cloud-based embedding model to avoid local downloads
+embeddings_model = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004", google_api_key=GEMINI_API_KEY)
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
 
 # ================= APP ===================
@@ -47,7 +47,7 @@ app = FastAPI(title="SaaS Chatbot Demo")
 # - Prod: use your frontend domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Change this to ["https://yourfrontend.com"] in prod
+    allow_origins=["*"],  # Change this to ["https://yourfrontend.com"] in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -132,16 +132,29 @@ def crawl_website(url: str):
 
 
 def parse_pdf(pdf_file: UploadFile):
-    temp_path = f"./temp_{pdf_file.filename}"
-    with open(temp_path, "wb") as f:
-        shutil.copyfileobj(pdf_file.file, f)
-    parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
-    parsed = parser.load_data(temp_path)
-    os.remove(temp_path)
-    docs = [
-        Document(page_content=d.text, metadata={"source": pdf_file.filename or ""})
-        for d in parsed
-    ]
+    # Ensure the temp directory exists
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Create a unique temporary file path
+    temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{pdf_file.filename}")
+    
+    try:
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(pdf_file.file, f)
+        
+        parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
+        parsed = parser.load_data(temp_path)
+        
+        docs = [
+            Document(page_content=d.text, metadata={"source": pdf_file.filename or ""})
+            for d in parsed
+        ]
+    finally:
+        # Clean up the temporary file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+            
     return docs
 
 
