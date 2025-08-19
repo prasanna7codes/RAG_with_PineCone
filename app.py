@@ -1,13 +1,13 @@
-# app.py
 
 import os
 import shutil
 import uuid
 from typing import Optional
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import (Depends, FastAPI, File, Form, Header, HTTPException,
-                     UploadFile)
+                     UploadFile, Request)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from firecrawl import FirecrawlApp, ScrapeOptions
@@ -43,9 +43,11 @@ llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot Demo")
 
+# ⚠️ IMPORTANT: Do NOT allow "*" in production
+# We’ll validate Origin ourselves inside get_client_id_from_key
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ⚠️ tighten this in production
+    allow_origins=["*"],   # This just allows preflight to go through
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,14 +57,26 @@ app.add_middleware(
 class QueryJSON(BaseModel):
     question: str
 
+# ================= HELPERS =================
+def normalize_domain(url: str) -> str:
+    """
+    Normalize URLs to plain domain (example.com).
+    Removes scheme, paths, etc.
+    """
+    if not url:
+        return None
+    parsed = urlparse(url if "://" in url else f"https://{url}")
+    return parsed.hostname.lower() if parsed.hostname else url.lower()
+
 # ================= SECURITY =================
-async def get_client_id_from_key(x_api_key: str = Header(None)):
+async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
 
+    # 1. Lookup client by apiKey
     response = (
         supabase.table("users_extra")
-        .select("id")
+        .select("id, company_url")
         .eq("public_api_key", x_api_key)
         .single()
         .execute()
@@ -71,7 +85,27 @@ async def get_client_id_from_key(x_api_key: str = Header(None)):
     if not response.data:
         raise HTTPException(status_code=403, detail="Invalid API Key provided")
 
-    return response.data.get("id")
+    client_id = response.data.get("id")
+    allowed_url = response.data.get("company_url")
+
+    # 2. Normalize allowed domain
+    allowed_domain = normalize_domain(allowed_url)
+    print(allowed_domain)
+
+    # 3. Extract origin/referer from request headers
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if not origin:
+        raise HTTPException(status_code=403, detail="Missing Origin header")
+
+    print(origin)
+    origin_domain = normalize_domain(origin)
+    print(origin_domain)
+
+    # 4. Compare
+    if origin_domain != allowed_domain:
+        raise HTTPException(status_code=403, detail=f"Unauthorized origin: {origin_domain}")
+
+    return client_id
 
 # ================= FUNCTIONS =================
 def crawl_website(url: str):
