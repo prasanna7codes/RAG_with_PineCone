@@ -18,6 +18,7 @@ from pinecone import Pinecone
 from pydantic import BaseModel
 from supabase import Client, create_client
 
+
 load_dotenv()
 
 # ================= CONFIG =================
@@ -71,7 +72,12 @@ def normalize_domain(url: str) -> Optional[str]:
     return hostname[4:] if hostname.startswith("www.") else hostname
 
 # ================= SECURITY =================
-async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)):
+# ================= SECURITY =================
+async def get_client_id_from_key(
+    request: Request,
+    x_api_key: str = Header(None),
+    x_client_domain: str = Header(None)
+):
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
 
@@ -90,29 +96,31 @@ async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)
     client_id = response.data.get("id")
     allowed_origins = response.data.get("allowed_origins") or []
 
-    # Get origin/referer header
-    origin = request.headers.get("origin") or request.headers.get("referer")
-    if not origin:
-        raise HTTPException(status_code=403, detail="Missing Origin header")
-
-    parsed_origin = urlparse(origin)
-    origin_domain = parsed_origin.hostname.lower() if parsed_origin.hostname else origin.lower()
-
-    # Remove www. prefix
-    if origin_domain.startswith("www."):
-        origin_domain = origin_domain[4:]
-
-    # Check allowed origins
+    # 🔑 normalize allowed domains
     normalized_allowed = [d.lower().lstrip("www.") for d in allowed_origins]
 
-    # ✅ Special handling: allow any localhost port
-    if origin_domain == "localhost":
+    # ✅ Take domain from X-Client-Domain if present
+    if x_client_domain:
+        client_domain = x_client_domain.lower().lstrip("www.")
+    else:
+        # fallback: origin header
+        origin = request.headers.get("origin") or request.headers.get("referer")
+        if not origin:
+            raise HTTPException(status_code=403, detail="Missing Origin header")
+        parsed_origin = urlparse(origin)
+        client_domain = parsed_origin.hostname.lower() if parsed_origin.hostname else origin.lower()
+        if client_domain.startswith("www."):
+            client_domain = client_domain[4:]
+
+    # Special handling for localhost
+    if client_domain == "localhost":
         return client_id
 
-    if origin_domain not in normalized_allowed:
-        raise HTTPException(status_code=403, detail=f"Unauthorized origin: {origin_domain}")
+    if client_domain not in normalized_allowed:
+        raise HTTPException(status_code=403, detail=f"Unauthorized origin: {client_domain}")
 
     return client_id
+
 
 # ================= FUNCTIONS =================
 def crawl_website(url: str):
