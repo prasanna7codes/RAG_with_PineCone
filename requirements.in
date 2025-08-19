@@ -2,6 +2,7 @@ fastapi
 uvicorn
 python-dotenv
 pinecone
+langchain
 langchain-core
 langchain-text-splitters
 langchain-google-genai
@@ -11,5 +12,3 @@ firecrawl-py
 supabase
 python-multipart
 sentence-transformers
- celery 
- redis
