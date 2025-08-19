@@ -47,7 +47,7 @@ app = FastAPI(title="SaaS Chatbot Demo")
 # - Prod: use your frontend domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rag-cloud-embedding-frontend.vercel.app"],  # Change this to ["https://yourfrontend.com"] in prod
+    allow_origins=["*"],  # Change this to ["https://yourfrontend.com"] in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -72,9 +72,6 @@ def normalize_domain(url: str) -> Optional[str]:
 
 # ================= SECURITY =================
 async def get_client_id_from_key(request: Request, x_api_key: str = Header(None)):
-    if request.method == "OPTIONS":
-        return None
-
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing in headers")
 
