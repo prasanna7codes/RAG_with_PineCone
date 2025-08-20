@@ -48,7 +48,8 @@ app = FastAPI(title="SaaS Chatbot Demo")
 # - Prod: use your frontend domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rag-cloud-embedding-frontend.vercel.app"], 
+    allow_origins=["https://rag-cloud-embedding-frontend.vercel.app",
+                   "https://chatbot-insight-opal.vercel.app"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
