@@ -48,7 +48,7 @@ app = FastAPI(title="SaaS Chatbot Demo")
 # - Prod: use your frontend domain(s)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rag-cloud-embedding-frontend.vercel.app"],  # Change this to ["https://yourfrontend.com"] in prod
+    allow_origins=["https://rag-cloud-embedding-frontend.vercel.app"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -72,7 +72,7 @@ def normalize_domain(url: str) -> Optional[str]:
     return hostname[4:] if hostname.startswith("www.") else hostname
 
 # ================= SECURITY =================
-# ================= SECURITY =================
+
 async def get_client_id_from_key(
     request: Request,
     x_api_key: str = Header(None),
@@ -112,10 +112,11 @@ async def get_client_id_from_key(
         if client_domain.startswith("www."):
             client_domain = client_domain[4:]
 
-    # Special handling for localhost
-    if client_domain == "localhost":
-        return client_id
+    # *** FIX: REMOVED THE SPECIAL HANDLING FOR LOCALHOST ***
+    # if client_domain == "localhost":
+    #     return client_id
 
+    # Now, localhost will be checked against the allowed list just like any other domain.
     if client_domain not in normalized_allowed:
         raise HTTPException(status_code=403, detail=f"Unauthorized origin: {client_domain}")
 
