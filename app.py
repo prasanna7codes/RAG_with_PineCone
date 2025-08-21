@@ -87,7 +87,7 @@ def send_client_email_resend(to_email: str, bot_response: str, user_contact: str
     """
 
     return resend.Emails.send({
-        "from": "Your App <no-reply@yourdomain.com>",
+        "from": "onboarding@resend.dev",
         "to": [to_email],
         "subject": subject,
         "html": html_body
@@ -258,6 +258,7 @@ async def feedback_endpoint(
         # 2. Fetch client email via RPC
         email_result = supabase.rpc("get_client_email", {"client_id": client_id}).execute()
         client_email = email_result.data
+        print(client_email)
 
         if client_email:
             # 3. Send email notification using Resend
