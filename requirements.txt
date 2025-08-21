@@ -314,10 +314,13 @@ requests==2.32.4
     #   llama-index-core
     #   pinecone-plugin-assistant
     #   requests-toolbelt
+    #   resend
     #   tiktoken
     #   transformers
 requests-toolbelt==1.0.0
     # via langsmith
+resend==2.13.0
+    # via -r requirements.in
 rsa==4.9.1
     # via google-auth
 safetensors==0.6.2
@@ -388,6 +391,7 @@ typing-extensions==4.14.1
     #   pydantic
     #   pydantic-core
     #   realtime
+    #   resend
     #   sentence-transformers
     #   sqlalchemy
     #   torch

@@ -18,6 +18,10 @@ from pinecone import Pinecone
 from pydantic import BaseModel
 from supabase import Client, create_client
 
+import resend
+from fastapi import FastAPI, Depends
+from fastapi.responses import JSONResponse
+
 load_dotenv()
 
 # ================= CONFIG =================
@@ -28,6 +32,7 @@ PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 INDEX_NAME = "clinet-data-google"
+resend.api_key = os.getenv("RESEND_API_KEY")
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -65,6 +70,29 @@ def normalize_domain(url: str) -> Optional[str]:
     parsed = urlparse(url if "://" in url else f"https://{url}")
     hostname = parsed.hostname.lower() if parsed.hostname else url.lower()
     return hostname[4:] if hostname.startswith("www.") else hostname
+
+
+def send_client_email_resend(to_email: str, bot_response: str, user_contact: str):
+    """
+    Sends an email notification to the client using Resend.
+    """
+    subject = "New Feedback Submitted on Your Chatbot"
+
+    # You can also build a nice HTML template here
+    html_body = f"""
+    <h2>New Feedback Received</h2>
+    <p><b>Bot Response:</b> {bot_response}</p>
+    <p><b>User Contact:</b> {user_contact}</p>
+    <p>Regards,<br/>InsightBot</p>
+    """
+
+    return resend.Emails.send({
+        "from": "Your App <no-reply@yourdomain.com>",
+        "to": [to_email],
+        "subject": subject,
+        "html": html_body
+    })
+
 
 # ================= SECURITY =================
 async def get_client_id_from_key(
@@ -218,10 +246,25 @@ async def feedback_endpoint(
     client_id: str = Depends(get_client_id_from_key),
     session_id: str = Depends(get_session_id)
 ):
-    supabase.table("chat_feedback").insert({
-        "client_id": client_id,
-        "session_id": session_id,
-        "bot_response": json_data.botResponse,
-        "user_contact": json_data.userContact
-    }).execute()
-    return {"message": "Feedback received"}
+    try:
+        # 1. Insert feedback into DB
+        supabase.table("chat_feedback").insert({
+            "client_id": client_id,
+            "session_id": session_id,
+            "bot_response": json_data.botResponse,
+            "user_contact": json_data.userContact
+        }).execute()
+
+        # 2. Fetch client email via RPC
+        email_result = supabase.rpc("get_client_email", {"client_id": client_id}).execute()
+        client_email = email_result.data
+
+        if client_email:
+            # 3. Send email notification using Resend
+            send_client_email_resend(client_email, json_data.botResponse, json_data.userContact)
+
+        return {"message": "Feedback received and client notified"}
+
+    except Exception as e:
+        print(f"Error handling feedback: {e}")
+        return JSONResponse({"error": "An error occurred while processing feedback."}, status_code=500)
