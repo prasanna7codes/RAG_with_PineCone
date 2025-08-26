@@ -211,31 +211,38 @@ def chatbot_query(client_id: str, question: str):
     return answer.content
 
 # ================= Visitor JWT (for Supabase Realtime) =================
+
+
 def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, ttl_minutes: int = 30) -> str:
     """
-    Mint a short-lived JWT recognized by Supabase (has 'aud' and 'sub').
-    Custom claims are used by RLS policies via auth.jwt().
+    IMPORTANT:
+    - 'role' must be 'authenticated' so PostgREST can SET ROLE authenticated
+    - carry your own marker claim like 'actor': 'visitor' for RLS checks
     """
     if not SUPABASE_JWT_SECRET:
         raise RuntimeError("Missing SUPABASE_JWT_SECRET")
     now = datetime.datetime.utcnow()
 
-    # Deterministic subject for this visitor-session
     sub = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{client_id}:{session_id}"))
 
     payload = {
         "aud": "authenticated",
-        "sub": sub,  # IMPORTANT: Supabase expects a subject
+        "sub": sub,
         "exp": now + datetime.timedelta(minutes=ttl_minutes),
         "iat": now,
 
-        # custom claims used by RLS
-        "role": "visitor",
+        # DB role MUST be 'authenticated'
+        "role": "authenticated",
+
+        # your custom claims for RLS
+        "actor": "visitor",
         "client_id": client_id,
         "session_id": session_id,
         "conversation_id": conversation_id,
     }
     return jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
+
+
 
 # ================= API ROUTES =================
 @app.post("/ingest/")
