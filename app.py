@@ -212,13 +212,24 @@ def chatbot_query(client_id: str, question: str):
 
 # ================= Visitor JWT (for Supabase Realtime) =================
 def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, ttl_minutes: int = 30) -> str:
+    """
+    Mint a short-lived JWT recognized by Supabase (has 'aud' and 'sub').
+    Custom claims are used by RLS policies via auth.jwt().
+    """
     if not SUPABASE_JWT_SECRET:
         raise RuntimeError("Missing SUPABASE_JWT_SECRET")
     now = datetime.datetime.utcnow()
+
+    # Deterministic subject for this visitor-session
+    sub = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{client_id}:{session_id}"))
+
     payload = {
         "aud": "authenticated",
+        "sub": sub,  # IMPORTANT: Supabase expects a subject
         "exp": now + datetime.timedelta(minutes=ttl_minutes),
         "iat": now,
+
+        # custom claims used by RLS
         "role": "visitor",
         "client_id": client_id,
         "session_id": session_id,
