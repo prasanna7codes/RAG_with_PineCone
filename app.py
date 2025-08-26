@@ -1,13 +1,13 @@
 import os
 import shutil
 import uuid
-import json
-from typing import Optional, Tuple, Dict, Any
+import datetime
+from typing import Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import (
-    Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request, Path, Query
+    Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request, Path
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -22,21 +22,20 @@ from pinecone import Pinecone
 from supabase import Client, create_client
 import resend
 import jwt
-import datetime
 
 # ================= CONFIG =================
 load_dotenv()
 
-FIRECRAWL_API_KEY = os.getenv("FIRECRAWL_API_KEY")
-LLAMA_API_KEY = os.getenv("LLAMA_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
-SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")
-INDEX_NAME = os.getenv("INDEX_NAME", "clinet-data-google")
-resend.api_key = os.getenv("RESEND_API_KEY")
+FIRECRAWL_API_KEY     = os.getenv("FIRECRAWL_API_KEY")
+LLAMA_API_KEY         = os.getenv("LLAMA_API_KEY")
+GEMINI_API_KEY        = os.getenv("GEMINI_API_KEY")
+PINECONE_API_KEY      = os.getenv("PINECONE_API_KEY")
+SUPABASE_URL          = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_KEY  = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+SUPABASE_ANON_KEY     = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_JWT_SECRET   = os.getenv("SUPABASE_JWT_SECRET")
+INDEX_NAME            = os.getenv("INDEX_NAME", "clinet-data-google")
+resend.api_key        = os.getenv("RESEND_API_KEY")
 
 ALLOWED_WIDGET_ORIGINS = [
     o.strip() for o in (os.getenv("ALLOWED_WIDGET_ORIGINS") or "").split(",") if o.strip()
@@ -49,7 +48,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ================= GLOBAL MODELS =================
 embeddings_model = GoogleGenerativeAIEmbeddings(
-    model="models/text-embedding-004", google_api_key=GEMINI_API_KEY
+    model="models/text-embedding-004",
+    google_api_key=GEMINI_API_KEY
 )
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
 
@@ -58,7 +58,10 @@ app = FastAPI(title="SaaS Chatbot + Live Handoff")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_WIDGET_ORIGINS,
+    allow_origins=ALLOWED_WIDGET_ORIGINS or [
+        "https://rag-cloud-embedding-frontend.vercel.app",
+        "https://chatbot-insight-opal.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -102,21 +105,23 @@ def send_client_email_resend(to_email: str, bot_response: str, user_contact: str
 async def get_client_id_from_key(
     request: Request,
     x_api_key: str = Header(None, alias="X-API-Key"),
-    x_client_domain: str = Header(None, alias="X-Client-Domain")
+    x_client_domain: str = Header(None, alias="X-Client-Domain"),
 ) -> str:
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing")
-    response = (
+
+    resp = (
         supabase.table("users_extra")
         .select("id, allowed_origins")
         .eq("public_api_key", x_api_key)
         .single()
         .execute()
     )
-    if not response.data:
+    if not resp.data:
         raise HTTPException(status_code=403, detail="Invalid API Key")
-    client_id = response.data.get("id")
-    allowed_origins = response.data.get("allowed_origins") or []
+
+    client_id = resp.data["id"]
+    allowed_origins = (resp.data.get("allowed_origins") or [])
     normalized_allowed = [d.lower().lstrip("www.") for d in allowed_origins]
 
     if x_client_domain:
@@ -132,6 +137,7 @@ async def get_client_id_from_key(
 
     if normalized_allowed and client_domain not in normalized_allowed:
         raise HTTPException(status_code=403, detail=f"Unauthorized origin: {client_domain}")
+
     return client_id
 
 async def get_session_id(x_session_id: str = Header(None, alias="X-Session-Id")) -> str:
@@ -187,7 +193,7 @@ def store_in_pinecone(chunks, client_id: str):
                 {
                     "client_id": client_id,
                     "source": str(chunk.metadata.get("source") or ""),
-                    "content": chunk.page_content
+                    "content": chunk.page_content,
                 },
             )
         )
@@ -204,7 +210,7 @@ def chatbot_query(client_id: str, question: str):
     answer = llm.invoke(prompt)
     return answer.content
 
-# ================= VISITOR JWT (for Supabase Realtime) =================
+# ================= Visitor JWT (for Supabase Realtime) =================
 def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, ttl_minutes: int = 30) -> str:
     if not SUPABASE_JWT_SECRET:
         raise RuntimeError("Missing SUPABASE_JWT_SECRET")
@@ -216,13 +222,11 @@ def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, t
         "role": "visitor",
         "client_id": client_id,
         "session_id": session_id,
-        "conversation_id": conversation_id
+        "conversation_id": conversation_id,
     }
-    token = jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
-    return token
+    return jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
 
 # ================= API ROUTES =================
-
 @app.post("/ingest/")
 async def ingest_data(
     client_id: str = Form(...),
@@ -244,11 +248,10 @@ async def ingest_data(
 async def query_chatbot_endpoint(
     json_data: QueryJSON,
     client_id: str = Depends(get_client_id_from_key),
-    session_id: str = Depends(get_session_id)
+    session_id: str = Depends(get_session_id),
 ):
     try:
         answer = chatbot_query(client_id, json_data.question)
-        # Log visitor conversation
         supabase.table("chat_logs").insert({
             "client_id": client_id,
             "session_id": session_id,
@@ -257,14 +260,14 @@ async def query_chatbot_endpoint(
         }).execute()
         return {"answer": answer}
     except Exception as e:
-        print(f"An error occurred during query: {e}")
-        return JSONResponse({"error": "An internal server error occurred."}, status_code=500)
+        print("query error:", e)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 @app.post("/feedback/")
 async def feedback_endpoint(
     json_data: FeedbackJSON,
     client_id: str = Depends(get_client_id_from_key),
-    session_id: str = Depends(get_session_id)
+    session_id: str = Depends(get_session_id),
 ):
     try:
         supabase.table("chat_feedback").insert({
@@ -281,11 +284,10 @@ async def feedback_endpoint(
 
         return {"message": "Feedback received and client notified"}
     except Exception as e:
-        print(f"Error handling feedback: {e}")
-        return JSONResponse({"error": "An error occurred while processing feedback."}, status_code=500)
+        print("feedback error:", e)
+        return JSONResponse({"error": "Internal server error"}, status_code=500)
 
 # ========== LIVE HANDOFF ==========
-
 @app.post("/live/request")
 async def live_request(
     payload: LiveRequestJSON,
@@ -294,23 +296,25 @@ async def live_request(
 ):
     """
     Create (or reuse) a live conversation for this {client_id, session_id}.
-    Returns {conversation_id, supabase_jwt}.
+    Returns {conversation_id, supabase_jwt, status}.
     """
     try:
-        # Check existing open conversation
-        existing = (
+        # robust find (no maybe_single)
+        resp = (
             supabase.table("live_conversations")
-            .select("id, status")
+            .select("id,status,created_at")
             .eq("client_id", client_id)
             .eq("session_id", session_id)
             .in_("status", ["pending", "active"])
-            .maybe_single()
+            .order("created_at", desc=False)
+            .limit(1)
             .execute()
         )
-        if existing.data:
-            conversation_id = existing.data["id"]
+        rows = resp.data or []
+        if rows:
+            conversation_id = rows[0]["id"]
+            current_status = rows[0]["status"]
         else:
-            # Create new pending conversation
             ins = (
                 supabase.table("live_conversations")
                 .insert({
@@ -319,13 +323,16 @@ async def live_request(
                     "status": "pending",
                     "requested_by_contact": payload.requested_by_contact,
                 })
-                .select("id")
-                .single()
+                .select("id,status")
                 .execute()
             )
-            conversation_id = ins.data["id"]
+            ins_rows = ins.data or []
+            if not ins_rows:
+                raise HTTPException(status_code=500, detail="Conversation creation failed")
+            conversation_id = ins_rows[0]["id"]
+            current_status = ins_rows[0]["status"]
 
-            # Optional: seed a system message
+            # optional: seed a system message
             supabase.table("live_messages").insert({
                 "conversation_id": conversation_id,
                 "sender_type": "system",
@@ -338,8 +345,10 @@ async def live_request(
             conversation_id=conversation_id,
             ttl_minutes=30
         )
-        return {"conversation_id": conversation_id, "supabase_jwt": token, "status": existing.data["status"] if existing.data else "pending"}
+        return {"conversation_id": conversation_id, "supabase_jwt": token, "status": current_status}
 
+    except HTTPException:
+        raise
     except Exception as e:
         print("live_request error:", e)
         raise HTTPException(status_code=500, detail="Unable to create live conversation")
@@ -353,25 +362,29 @@ async def live_join(
     Mint a fresh visitor JWT to rejoin an open conversation (pending/active).
     """
     try:
-        found = (
+        resp = (
             supabase.table("live_conversations")
-            .select("id, status")
+            .select("id,status,created_at")
             .eq("client_id", client_id)
             .eq("session_id", session_id)
             .in_("status", ["pending", "active"])
-            .maybe_single()
+            .order("created_at", desc=False)
+            .limit(1)
             .execute()
         )
-        if not found.data:
+        rows = resp.data or []
+        if not rows:
             raise HTTPException(status_code=404, detail="No open conversation")
-        conversation_id = found.data["id"]
+        conversation_id = rows[0]["id"]
+        status = rows[0]["status"]
+
         token = mint_visitor_jwt(
             client_id=client_id,
             session_id=session_id,
             conversation_id=conversation_id,
             ttl_minutes=30
         )
-        return {"conversation_id": conversation_id, "supabase_jwt": token, "status": found.data["status"]}
+        return {"conversation_id": conversation_id, "supabase_jwt": token, "status": status}
     except HTTPException:
         raise
     except Exception as e:
@@ -385,12 +398,11 @@ async def live_history(
     session_id: str = Depends(get_session_id),
 ):
     """
-    Give executives (and optionally the widget) the context/history:
-    - Live messages for this conversation
-    - Prior bot/visitor transcript from chat_logs for the same session
+    Return:
+      - live_messages for the conversation
+      - prior bot/visitor Q&A (chat_logs) for the same session
     """
     try:
-        # Validate conversation belongs to client
         conv = (
             supabase.table("live_conversations")
             .select("id, client_id, session_id")
@@ -419,7 +431,6 @@ async def live_history(
         ).data or []
 
         return {"live_messages": live_msgs, "bot_transcript": bot_logs}
-
     except HTTPException:
         raise
     except Exception as e:

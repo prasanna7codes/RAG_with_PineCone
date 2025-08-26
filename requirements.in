@@ -13,3 +13,4 @@ supabase
 python-multipart
 sentence-transformers
 resend
+PyJWT
