@@ -230,17 +230,15 @@ def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, t
         "sub": sub,
         "exp": now + datetime.timedelta(minutes=ttl_minutes),
         "iat": now,
-
-        # DB role MUST be 'authenticated'
-        "role": "authenticated",
-
-        # your custom claims for RLS
-        "actor": "visitor",
+        "role": "authenticated",      # MUST be this
+        "actor": "visitor",           # your RLS marker
         "client_id": client_id,
         "session_id": session_id,
         "conversation_id": conversation_id,
     }
-    return jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
+    token = jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
+    print("ISSUED VISITOR JWT PAYLOAD:", payload)  # <-- add temporarily
+    return token
 
 
 
