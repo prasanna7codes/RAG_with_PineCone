@@ -299,7 +299,7 @@ async def live_request(
     Returns {conversation_id, supabase_jwt, status}.
     """
     try:
-        # robust find (no maybe_single)
+        # Look for an existing open conversation
         resp = (
             supabase.table("live_conversations")
             .select("id,status,created_at")
@@ -315,24 +315,18 @@ async def live_request(
             conversation_id = rows[0]["id"]
             current_status = rows[0]["status"]
         else:
-            ins = (
-                supabase.table("live_conversations")
-                .insert({
-                    "client_id": client_id,
-                    "session_id": session_id,
-                    "status": "pending",
-                    "requested_by_contact": payload.requested_by_contact,
-                })
-                .select("id,status")
-                .execute()
-            )
-            ins_rows = ins.data or []
-            if not ins_rows:
-                raise HTTPException(status_code=500, detail="Conversation creation failed")
-            conversation_id = ins_rows[0]["id"]
-            current_status = ins_rows[0]["status"]
+            # Pre-generate ID to avoid insert→select chaining
+            conversation_id = str(uuid.uuid4())
+            current_status = "pending"
+            supabase.table("live_conversations").insert({
+                "id": conversation_id,
+                "client_id": client_id,
+                "session_id": session_id,
+                "status": current_status,
+                "requested_by_contact": payload.requested_by_contact,
+            }).execute()
 
-            # optional: seed a system message
+            # optional: system seed
             supabase.table("live_messages").insert({
                 "conversation_id": conversation_id,
                 "sender_type": "system",
