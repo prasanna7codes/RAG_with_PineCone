@@ -66,8 +66,7 @@ app.add_middleware(
     allow_origins=ALLOWED_WIDGET_ORIGINS or [
         "https://rag-cloud-embedding-frontend.vercel.app",
         "https://chatbot-insight-opal.vercel.app",
-        "http://localhost:5173",
-        "http://localhost:3000",
+        
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -196,10 +195,6 @@ def get_credits_remaining(client_id: str) -> Dict[str, int]:
     }
 
 def ensure_credits_row(client_id: str) -> None:
-    """
-    Ensure there is a row in client_credits for this client.
-    Uses an upsert with defaults (0,0) to avoid PGRST116 when .single() finds 0 rows.
-    """
     try:
         res = (
             supabase.table("client_credits")
@@ -314,9 +309,6 @@ def canonicalize_urls(urls: list) -> list:
 
 # ======== Fallback helpers (map + scrape with logging) =========
 def _path_glob_predicate(include_paths: Optional[List[str]], exclude_paths: Optional[List[str]]):
-    """
-    Very simple '/*' -> startswith() glob logic.
-    """
     inc = include_paths or []
     exc = exclude_paths or []
 
@@ -345,7 +337,8 @@ def _path_glob_predicate(include_paths: Optional[List[str]], exclude_paths: Opti
 def firecrawl_scrape(url: str) -> Optional[Dict]:
     endpoint = "https://api.firecrawl.dev/v1/scrape"
     headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
-    payload = {"url": url, "formats": ["markdown", "metadata"]}
+    # formats: only markdown (metadata/links removed)
+    payload = {"url": url, "formats": ["markdown"]}
     try:
         print(f"[firecrawl_scrape] POST {endpoint} url={url}")
         r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
@@ -357,7 +350,11 @@ def firecrawl_scrape(url: str) -> Optional[Dict]:
             print(f"[firecrawl_scrape] error {r.status_code} {body}")
             return None
         data = r.json() or {}
-        return {"url": url, "markdown": data.get("markdown") or "", "metadata": data.get("metadata") or {}}
+        return {
+            "url": url,
+            "markdown": data.get("markdown") or "",
+            "metadata": data.get("metadata") or {}  # tolerated if Firecrawl returns something
+        }
     except Exception as e:
         print(f"[firecrawl_scrape] exception url={url} err={e}")
         return None
@@ -397,13 +394,13 @@ def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=N
     if safe_limit > 2000:
         safe_limit = 2000
 
+    # formats: only markdown
     payload = {
         "url": url,
         "crawlEntireDomain": True,
-        # "sitemap": "include",  # optional
         "maxDiscoveryDepth": 4,
         "limit": safe_limit,
-        "scrapeOptions": {"formats": ["markdown", "metadata"]},
+        "scrapeOptions": {"formats": ["markdown"]},
     }
     if include_paths:
         payload["includePaths"] = include_paths
@@ -553,7 +550,8 @@ async def ingest_url(
             if not md.strip():
                 continue
             src = p.get("url") or ""
-            title = ((p.get("metadata") or {}).get("title")) or ""
+            # title may come from metadata or not; tolerate both
+            title = ((p.get("metadata") or {}).get("title")) or p.get("title") or ""
             docs.append(Document(page_content=md, metadata={"source": src, "title": title}))
             actual += 1
 
@@ -666,7 +664,7 @@ def crawl_website(url: str):
     crawl_status = app_fc.crawl_url(
         url,
         limit=10,
-        scrape_options=ScrapeOptions(formats=["markdown"]),
+        scrape_options=ScrapeOptions(formats=["markdown"]),  # legacy path ok, only markdown
         poll_interval=30,
     )
     docs = [
@@ -937,10 +935,6 @@ async def live_history(
 # === CREDITS SNAPSHOT (lifetime) ===
 @app.get("/credits")
 async def get_credits(client_id: str = Depends(get_client_id_from_key)):
-    """
-    Returns the current one-time credits for this client.
-    Does NOT mutate anything.
-    """
     ensure_credits_row(client_id)
 
     prof = (
@@ -972,10 +966,6 @@ async def ingest_pdf_preview(
     client_id: str = Depends(get_client_id_from_key),
     pdf: UploadFile = File(...),
 ):
-    """
-    Uploads file temporarily, counts pages, then deletes.
-    Does NOT consume credits. Used by dashboard before actual ingest.
-    """
     ensure_credits_row(client_id)
 
     cc = (
