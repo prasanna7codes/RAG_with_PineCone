@@ -281,6 +281,8 @@ pyjwt==2.10.1
     # via
     #   -r requirements.in
     #   supabase-auth
+pypdf2==3.0.1
+    # via -r requirements.in
 python-dateutil==2.9.0.post0
     # via
     #   pinecone
@@ -308,6 +310,7 @@ regex==2025.7.34
     #   transformers
 requests==2.32.4
     # via
+    #   -r requirements.in
     #   firecrawl-py
     #   google-api-core
     #   huggingface-hub

@@ -14,3 +14,5 @@ python-multipart
 sentence-transformers
 resend
 PyJWT
+requests
+PyPDF2
