@@ -17,7 +17,8 @@ import requests
 from PyPDF2 import PdfReader
 from collections import defaultdict
 
-from firecrawl import FirecrawlApp, ScrapeOptions  # SDK (kept for legacy /ingest/)
+# --- kept for your legacy /ingest/ endpoint + chatbot ---
+from firecrawl import FirecrawlApp, ScrapeOptions
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -58,7 +59,7 @@ embeddings_model = GoogleGenerativeAIEmbeddings(
 llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
 
 # ================= APP ===================
-app = FastAPI(title="SaaS Chatbot + Live Handoff + Ingestion Limits")
+app = FastAPI(title="SaaS Chatbot + Live Handoff + Lifetime Credits")
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,7 +74,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Optional: catch-all OPTIONS (belt & suspenders)
+# Optional: catch-all OPTIONS
 @app.options("/{rest_of_path:path}")
 def preflight_handler():
     return JSONResponse({"ok": True})
@@ -94,8 +95,8 @@ class PreviewResponse(BaseModel):
     discovered_pages: int
     top_paths: List[str]
     sample_urls: List[str]
-    allowed_pages_for_plan: int
-    allowed: bool
+    allowed_pages_for_plan: int  # now = credits remaining (website)
+    allowed: bool                # discovered_pages <= remaining ?
 
 class IngestURLJSON(BaseModel):
     url: str
@@ -173,72 +174,36 @@ async def get_session_id(x_session_id: str = Header(None, alias="X-Session-Id"))
         raise HTTPException(status_code=400, detail="Missing X-Session-Id header")
     return x_session_id
 
-# ================= PLAN + USAGE HELPERS =================
-def month_start_utc_iso() -> str:
-    now = datetime.datetime.now(datetime.timezone.utc)
-    ms = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    return ms.isoformat()
-
-def get_plan_limits(client_id: str) -> Dict[str, int]:
-    ue = (
-        supabase.table("users_extra")
-        .select("plan")
-        .eq("id", client_id)
-        .single()
-        .execute()
-    ).data
-    plan = (ue or {}).get("plan", "starter")
-
-    pl = (
-        supabase.table("plan_limits")
-        .select("max_uploads_per_period, max_pages_per_crawl, max_pdf_pages_per_file, max_pdf_pages_per_period, max_website_pages_per_period")
-        .eq("plan", plan)
+# ================= CREDITS HELPERS (lifetime) =================
+def get_credits_remaining(client_id: str) -> Dict[str, int]:
+    row = (
+        supabase.table("client_credits")
+        .select("website_pages_remaining, pdf_pages_remaining")
+        .eq("client_id", client_id)
         .single()
         .execute()
     ).data or {}
-
     return {
-        "max_uploads_per_period": pl.get("max_uploads_per_period", 5),
-        "max_pages_per_crawl": pl.get("max_pages_per_crawl", 20),
-        "max_pdf_pages_per_file": pl.get("max_pdf_pages_per_file", 20),
-        "max_pdf_pages_per_period": pl.get("max_pdf_pages_per_period", 100),
-        "max_website_pages_per_period": pl.get("max_website_pages_per_period", 100),
+        "website": int(row.get("website_pages_remaining", 0) or 0),
+        "pdf": int(row.get("pdf_pages_remaining", 0) or 0),
     }
 
-def uploads_used_this_period(client_id: str) -> int:
-    month_start = month_start_utc_iso()
-    resp = (
-        supabase.table("ingestion_events")
-        .select("id")
-        .eq("client_id", client_id)
-        .gte("created_at", month_start)
-        .execute()
-    )
-    return len(resp.data or [])
+def reserve_website_credits(client_id: str, pages: int) -> bool:
+    # requires SQL RPC: reserve_website_pages(p_client_id uuid, p_pages int) returns boolean
+    res = supabase.rpc("reserve_website_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
+    return bool(res.data)
 
-def website_pages_used_this_period(client_id: str) -> int:
-    month_start = month_start_utc_iso()
-    resp = (
-        supabase.table("ingestion_events")
-        .select("website_pages_crawled")
-        .eq("client_id", client_id)
-        .gte("created_at", month_start)
-        .execute()
-    )
-    rows = resp.data or []
-    return sum((r.get("website_pages_crawled") or 0) for r in rows)
+def refund_website_credits(client_id: str, pages: int) -> None:
+    if pages > 0:
+        supabase.rpc("refund_website_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
 
-def pdf_pages_used_this_period(client_id: str) -> int:
-    month_start = month_start_utc_iso()
-    resp = (
-        supabase.table("ingestion_events")
-        .select("pdf_pages")
-        .eq("client_id", client_id)
-        .gte("created_at", month_start)
-        .execute()
-    )
-    rows = resp.data or []
-    return sum((r.get("pdf_pages") or 0) for r in rows)
+def reserve_pdf_credits(client_id: str, pages: int) -> bool:
+    res = supabase.rpc("reserve_pdf_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
+    return bool(res.data)
+
+def refund_pdf_credits(client_id: str, pages: int) -> None:
+    if pages > 0:
+        supabase.rpc("refund_pdf_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
 
 # ================= DISCOVERY (sitemap → Firecrawl map) =================
 SITEMAP_RE = re.compile(r"<loc>(.*?)</loc>", re.IGNORECASE)
@@ -275,6 +240,7 @@ def fetch_sitemap_urls(domain_or_url: str, timeout=15) -> list:
     return sorted(urls)
 
 def firecrawl_map(url: str) -> list:
+    # REST map endpoint is fast & cheap to enumerate
     endpoint = "https://api.firecrawl.dev/v1/map"
     headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
     payload = {"url": url}
@@ -305,7 +271,7 @@ def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=N
         "crawlEntireDomain": True,
         "sitemap": "include",
         "maxDiscoveryDepth": 4,
-        "limit": limit,
+        "limit": int(limit),
         "includePaths": include_paths or [],
         "excludePaths": exclude_paths or [],
         "scrapeOptions": {"formats": ["markdown", "metadata"]},
@@ -317,7 +283,7 @@ def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=N
     status_ep = f"{endpoint}/{job_id}"
 
     pages = []
-    for _ in range(90):
+    for _ in range(120):  # up to ~4 minutes; tune as needed
         s = requests.get(status_ep, headers=headers, timeout=30)
         if not s.ok:
             break
@@ -336,7 +302,7 @@ def chunk_documents(documents):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     return splitter.split_documents(documents)
 
-# ================= PREVIEW + INGEST ROUTES (limits enforced) =================
+# ================= PREVIEW (uses remaining website credits) =================
 @app.get("/ingest/preview", response_model=PreviewResponse)
 async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_key)):
     domain = normalize_domain(url) or url
@@ -352,103 +318,111 @@ async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_k
         buckets[part] += 1
     top_paths = [k for k, _ in sorted(buckets.items(), key=lambda x: (-x[1], x[0]))[:10]]
 
-    limits = get_plan_limits(client_id)
-    allowed = len(urls) <= limits["max_pages_per_crawl"]
+    credits = get_credits_remaining(client_id)
+    remaining = credits["website"]
+    allowed = len(urls) <= remaining if remaining > 0 else False
 
     return {
         "domain": domain,
         "discovered_pages": len(urls),
         "top_paths": top_paths,
         "sample_urls": urls[:10],
-        "allowed_pages_for_plan": limits["max_pages_per_crawl"],
+        "allowed_pages_for_plan": remaining,  # rename in UI later if you want
         "allowed": allowed
     }
 
+# ================= INGEST WEBSITE (lifetime credits) =================
 @app.post("/ingest/url")
 async def ingest_url(
     data: IngestURLJSON,
     client_id: str = Depends(get_client_id_from_key),
 ):
-    limits = get_plan_limits(client_id)
-
-    # monthly uploads cap
-    used_uploads = uploads_used_this_period(client_id)
-    if used_uploads >= limits["max_uploads_per_period"]:
-        raise HTTPException(403, detail=f"Monthly upload quota reached ({used_uploads}/{limits['max_uploads_per_period']}).")
-
-    # discovery
+    # 1) discover & compute how many we *intend* to crawl
     preview = await ingest_preview(url=data.url, client_id=client_id)
-    allowed_max = limits["max_pages_per_crawl"]
-    requested_limit = min(preview["discovered_pages"], allowed_max)
-    if data.force_limit:
-        requested_limit = min(requested_limit, int(data.force_limit))
+    credits = get_credits_remaining(client_id)
+    remaining = credits["website"]
 
-    if preview["discovered_pages"] > allowed_max and not data.include_paths:
-        raise HTTPException(
-            403,
-            detail=f"We found {preview['discovered_pages']} pages at {preview['domain']}. "
-                   f"Your plan allows {allowed_max} per crawl. Select includePaths or upgrade."
+    if remaining <= 0:
+        raise HTTPException(403, detail="No website page credits remaining. Please top up.")
+
+    discovered = int(preview["discovered_pages"])
+    # If user selected subsets, Firecrawl will still obey `limit`; we cap by remaining credits
+    intended = min(discovered if not data.force_limit else min(discovered, int(data.force_limit)),
+                   remaining)
+
+    if intended <= 0:
+        raise HTTPException(403, detail="Requested 0 pages after applying remaining credits/limit.")
+
+    # 2) reserve credits atomically
+    reserved = intended
+    ok = reserve_website_credits(client_id, reserved)
+    if not ok:
+        # someone else might have consumed credits concurrently
+        fresh = get_credits_remaining(client_id)["website"]
+        raise HTTPException(403, detail=f"Insufficient website credits. Remaining: {fresh}")
+
+    # 3) crawl with 'reserved' cap; refund if we used fewer
+    try:
+        pages = firecrawl_crawl(
+            data.url,
+            limit=reserved,
+            include_paths=data.include_paths,
+            exclude_paths=data.exclude_paths
         )
 
-    # monthly website pages cap
-    monthly_cap = limits.get("max_website_pages_per_period", 0) or 0
-    if monthly_cap > 0:
-        used_pages = website_pages_used_this_period(client_id)
-        remaining = monthly_cap - used_pages
-        if remaining <= 0:
-            raise HTTPException(403, detail=f"Monthly website pages quota exceeded ({used_pages}/{monthly_cap}).")
-        requested_limit = min(requested_limit, remaining)
+        actual = 0
+        docs = []
+        for p in pages:
+            md = p.get("markdown") or ""
+            if not md.strip():
+                continue
+            src = p.get("url") or ""
+            title = ((p.get("metadata") or {}).get("title")) or ""
+            docs.append(Document(page_content=md, metadata={"source": src, "title": title}))
+            actual += 1
 
-    # crawl
-    pages = firecrawl_crawl(
-        data.url,
-        limit=requested_limit,
-        include_paths=data.include_paths,
-        exclude_paths=data.exclude_paths
-    )
+        if not docs:
+            # Nothing extracted: refund everything
+            refund_website_credits(client_id, reserved)
+            return JSONResponse({"error": "No content extracted"}, status_code=400)
 
-    # transform → chunk
-    docs = []
-    for p in pages:
-        md = p.get("markdown") or ""
-        if not md.strip():
-            continue
-        src = p.get("url") or ""
-        title = ((p.get("metadata") or {}).get("title")) or ""
-        docs.append(Document(page_content=md, metadata={"source": src, "title": title}))
+        # chunk (indexing to vector store is your choice; here we only enforce credits)
+        chunks = chunk_documents(docs)
+        chunks_count = len(chunks)
 
-    if not docs:
-        return JSONResponse({"error": "No content extracted"}, status_code=400)
+        # Refund any unused reservations (Firecrawl returned fewer than reserved)
+        if actual < reserved:
+            refund_website_credits(client_id, reserved - actual)
 
-    chunks = chunk_documents(docs)
-    chunks_count = len(chunks)
+        # Log event
+        supabase.table("ingestion_events").insert({
+            "client_id": client_id,
+            "event_type": "url",
+            "source": data.url,
+            "chunks_stored": int(chunks_count),
+            "discovered_pages": discovered,
+            "website_pages_crawled": int(actual)
+        }).execute()
 
-    # log usage
-    supabase.table("ingestion_events").insert({
-        "client_id": client_id,
-        "event_type": "url",
-        "source": data.url,
-        "chunks_stored": int(chunks_count),
-        "discovered_pages": int(preview["discovered_pages"]),
-        "pages_allowed": int(allowed_max),
-        "website_pages_crawled": int(requested_limit)
-    }).execute()
+        return {"message": "Website ingested", "chunks_count": chunks_count, "used_pages": actual}
 
-    return {"message": "Website ingested", "chunks_count": chunks_count, "used_limit": requested_limit}
+    except Exception as e:
+        # On failure refund full reserved
+        refund_website_credits(client_id, reserved)
+        raise
 
+# ================= INGEST PDF (lifetime credits) =================
 @app.post("/ingest/pdf")
 async def ingest_pdf(
     client_id: str = Depends(get_client_id_from_key),
     pdf: UploadFile = File(...),
 ):
-    limits = get_plan_limits(client_id)
+    credits = get_credits_remaining(client_id)
+    remaining_pdf = credits["pdf"]
+    if remaining_pdf <= 0:
+        raise HTTPException(403, detail="No PDF page credits remaining. Please top up.")
 
-    # monthly uploads cap
-    used_uploads = uploads_used_this_period(client_id)
-    if used_uploads >= limits["max_uploads_per_period"]:
-        raise HTTPException(403, detail=f"Monthly upload quota reached ({used_uploads}/{limits['max_uploads_per_period']}).")
-
-    # temp save
+    # temp save to count pages
     temp_dir = "./temp"
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{pdf.filename}")
@@ -457,45 +431,65 @@ async def ingest_pdf(
 
     # count pages
     try:
-        reader = PdfReader(temp_path)
-        page_count = len(reader.pages)
-    except Exception:
-        page_count = 9999  # conservative if counting fails
+        try:
+            reader = PdfReader(temp_path)
+            page_count = len(reader.pages)
+        except Exception:
+            # If PyPDF2 fails to count, deny rather than over-consume
+            raise HTTPException(400, detail="Unable to read PDF pages. Please upload a valid PDF.")
 
-    # per-file cap
-    if page_count > limits["max_pdf_pages_per_file"]:
-        os.remove(temp_path)
-        raise HTTPException(403, detail=f"PDF has {page_count} pages; plan allows {limits['max_pdf_pages_per_file']} per file.")
+        if page_count <= 0:
+            os.remove(temp_path)
+            raise HTTPException(400, detail="PDF has 0 pages.")
 
-    # monthly pdf quota
-    used_pdf_pages = pdf_pages_used_this_period(client_id)
-    remaining_pdf = limits["max_pdf_pages_per_period"] - used_pdf_pages
-    if remaining_pdf <= 0 or page_count > remaining_pdf:
-        os.remove(temp_path)
-        raise HTTPException(403, detail=f"Monthly PDF page quota exceeded ({used_pdf_pages}/{limits['max_pdf_pages_per_period']}).")
+        if page_count > remaining_pdf:
+            os.remove(temp_path)
+            raise HTTPException(403, detail=f"Not enough PDF credits. Needed {page_count}, have {remaining_pdf}.")
 
-    # parse
-    try:
-        parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
-        parsed = parser.load_data(temp_path)
-        docs = [Document(page_content=d.text, metadata={"source": pdf.filename or ""}) for d in parsed]
-    finally:
+        # Reserve exactly the number of pages this file needs
+        ok = reserve_pdf_credits(client_id, page_count)
+        if not ok:
+            fresh = get_credits_remaining(client_id)["pdf"]
+            os.remove(temp_path)
+            raise HTTPException(403, detail=f"Insufficient PDF credits. Remaining: {fresh}")
+
+        # Parse with LlamaParse
+        try:
+            parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
+            parsed = parser.load_data(temp_path)
+            docs = [Document(page_content=d.text, metadata={"source": pdf.filename or ""}) for d in parsed]
+        except Exception:
+            # refund on parse failure
+            refund_pdf_credits(client_id, page_count)
+            raise
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        if not docs:
+            refund_pdf_credits(client_id, page_count)
+            return JSONResponse({"error": "No content extracted from PDF"}, status_code=400)
+
+        # chunk (index later if you want)
+        chunks = chunk_documents(docs)
+        chunks_count = len(chunks)
+
+        # Log event
+        supabase.table("ingestion_events").insert({
+            "client_id": client_id,
+            "event_type": "pdf",
+            "source": pdf.filename,
+            "chunks_stored": int(chunks_count),
+            "pdf_pages": int(page_count)
+        }).execute()
+
+        return {"message": "PDF ingested", "chunks_count": chunks_count, "pdf_pages": page_count}
+
+    except:
+        # defensive: ensure temp removed if we raised before the inner finally
         if os.path.exists(temp_path):
             os.remove(temp_path)
-
-    chunks = chunk_documents(docs)
-    chunks_count = len(chunks)
-
-    # log usage
-    supabase.table("ingestion_events").insert({
-        "client_id": client_id,
-        "event_type": "pdf",
-        "source": pdf.filename,
-        "chunks_stored": int(chunks_count),
-        "pdf_pages": int(page_count)
-    }).execute()
-
-    return {"message": "PDF ingested", "chunks_count": chunks_count, "pdf_pages": page_count}
+        raise
 
 # ================== CHATBOT + LIVE HANDOFF (unchanged) ==================
 def crawl_website(url: str):
@@ -562,7 +556,7 @@ def chatbot_query(client_id: str, question: str):
     answer = llm.invoke(prompt)
     return answer.content
 
-@app.post("/ingest/")  # legacy combined route
+@app.post("/ingest/")  # legacy combined route (does not enforce credits)
 async def ingest_data(
     client_id: str = Form(...),
     url: Optional[str] = Form(None),
