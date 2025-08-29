@@ -764,3 +764,82 @@ async def live_history(
     except Exception as e:
         print("live_history error:", e)
         raise HTTPException(status_code=500, detail="Unable to fetch history")
+
+
+# === CREDITS SNAPSHOT (lifetime) ===
+@app.get("/credits")
+async def get_credits(client_id: str = Depends(get_client_id_from_key)):
+    """
+    Returns the current one-time credits for this client.
+    Does NOT mutate anything.
+    """
+    # plan (optional, for UI)
+    prof = (
+        supabase.table("users_extra")
+        .select("plan")
+        .eq("id", client_id)
+        .single()
+        .execute()
+    ).data or {}
+    plan = prof.get("plan", "starter")
+
+    # remaining balances
+    cc = (
+        supabase.table("client_credits")
+        .select("website_pages_remaining, pdf_pages_remaining")
+        .eq("client_id", client_id)
+        .single()
+        .execute()
+    ).data or {"website_pages_remaining": 0, "pdf_pages_remaining": 0}
+
+    return {
+        "plan": plan,
+        "website_pages_remaining": int(cc.get("website_pages_remaining", 0) or 0),
+        "pdf_pages_remaining": int(cc.get("pdf_pages_remaining", 0) or 0),
+    }
+
+
+# === PDF PREVIEW (count pages only; no credits reservation) ===
+@app.post("/ingest/pdf/preview")
+async def ingest_pdf_preview(
+    client_id: str = Depends(get_client_id_from_key),
+    pdf: UploadFile = File(...),
+):
+    """
+    Uploads file temporarily, counts pages, then deletes.
+    Does NOT consume credits. Used by dashboard before actual ingest.
+    """
+    # fetch remaining credits to inform the UI
+    cc = (
+        supabase.table("client_credits")
+        .select("pdf_pages_remaining")
+        .eq("client_id", client_id)
+        .single()
+        .execute()
+    ).data or {"pdf_pages_remaining": 0}
+    remaining = int(cc.get("pdf_pages_remaining", 0) or 0)
+
+    temp_dir = "./temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    temp_path = os.path.join(temp_dir, f"preview_{uuid.uuid4()}_{pdf.filename}")
+
+    try:
+        with open(temp_path, "wb") as f:
+            shutil.copyfileobj(pdf.file, f)
+
+        try:
+            reader = PdfReader(temp_path)
+            page_count = len(reader.pages)
+        except Exception:
+            page_count = 0  # unreadable PDFs show 0 and allowed=False
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    return {
+        "filename": pdf.filename,
+        "page_count": page_count,
+        "pdf_pages_remaining": remaining,
+        "allowed": page_count > 0 and page_count <= remaining,
+    }
