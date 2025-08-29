@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 from fastapi import (
     Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, Request, Path
 )
-    # ^ kept your imports intact so chatbot routes still exist
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -18,7 +17,7 @@ import requests
 from PyPDF2 import PdfReader
 from collections import defaultdict
 
-from firecrawl import FirecrawlApp, ScrapeOptions  # SDK is fine; we use REST for crawl/map
+from firecrawl import FirecrawlApp, ScrapeOptions  # SDK (kept for legacy /ingest/)
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
@@ -66,11 +65,18 @@ app.add_middleware(
     allow_origins=ALLOWED_WIDGET_ORIGINS or [
         "https://rag-cloud-embedding-frontend.vercel.app",
         "https://chatbot-insight-opal.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional: catch-all OPTIONS (belt & suspenders)
+@app.options("/{rest_of_path:path}")
+def preflight_handler():
+    return JSONResponse({"ok": True})
 
 # ================= Pydantic Models =================
 class QueryJSON(BaseModel):
@@ -126,6 +132,10 @@ async def get_client_id_from_key(
     x_api_key: str = Header(None, alias="X-API-Key"),
     x_client_domain: str = Header(None, alias="X-Client-Domain"),
 ) -> str:
+    # Let CORS preflight pass
+    if request.method == "OPTIONS":
+        return "preflight"
+
     if not x_api_key:
         raise HTTPException(status_code=401, detail="API Key missing")
 
@@ -143,19 +153,18 @@ async def get_client_id_from_key(
     allowed_origins = (resp.data.get("allowed_origins") or [])
     normalized_allowed = [d.lower().lstrip("www.") for d in allowed_origins]
 
-    if x_client_domain:
-        client_domain = x_client_domain.lower().lstrip("www.")
-    else:
-        origin = request.headers.get("origin") or request.headers.get("referer")
-        if not origin:
-            raise HTTPException(status_code=403, detail="Missing Origin/Referer")
-        parsed_origin = urlparse(origin)
-        client_domain = (parsed_origin.hostname or origin).lower()
-        if client_domain.startswith("www."):
-            client_domain = client_domain[4:]
+    claimed = (x_client_domain or "").lower().lstrip("www.")
+    origin_hdr = request.headers.get("origin") or request.headers.get("referer")
+    origin_host = ""
+    if origin_hdr:
+        p = urlparse(origin_hdr)
+        origin_host = (p.hostname or "").lower()
+        if origin_host.startswith("www."):
+            origin_host = origin_host[4:]
 
-    if normalized_allowed and client_domain not in normalized_allowed:
-        raise HTTPException(status_code=403, detail=f"Unauthorized origin: {client_domain}")
+    candidates = [c for c in [claimed, origin_host] if c]
+    if normalized_allowed and not any(c in normalized_allowed for c in candidates):
+        raise HTTPException(status_code=403, detail=f"Unauthorized origin: {claimed or origin_host}")
 
     return client_id
 
@@ -165,6 +174,11 @@ async def get_session_id(x_session_id: str = Header(None, alias="X-Session-Id"))
     return x_session_id
 
 # ================= PLAN + USAGE HELPERS =================
+def month_start_utc_iso() -> str:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ms = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return ms.isoformat()
+
 def get_plan_limits(client_id: str) -> Dict[str, int]:
     ue = (
         supabase.table("users_extra")
@@ -192,33 +206,35 @@ def get_plan_limits(client_id: str) -> Dict[str, int]:
     }
 
 def uploads_used_this_period(client_id: str) -> int:
+    month_start = month_start_utc_iso()
     resp = (
         supabase.table("ingestion_events")
         .select("id")
         .eq("client_id", client_id)
-        .gte("created_at", "date_trunc('month', now())")
+        .gte("created_at", month_start)
         .execute()
     )
-    rows = resp.data or []
-    return len(rows)
+    return len(resp.data or [])
 
 def website_pages_used_this_period(client_id: str) -> int:
+    month_start = month_start_utc_iso()
     resp = (
         supabase.table("ingestion_events")
         .select("website_pages_crawled")
         .eq("client_id", client_id)
-        .gte("created_at", "date_trunc('month', now())")
+        .gte("created_at", month_start)
         .execute()
     )
     rows = resp.data or []
     return sum((r.get("website_pages_crawled") or 0) for r in rows)
 
 def pdf_pages_used_this_period(client_id: str) -> int:
+    month_start = month_start_utc_iso()
     resp = (
         supabase.table("ingestion_events")
         .select("pdf_pages")
         .eq("client_id", client_id)
-        .gte("created_at", "date_trunc('month', now())")
+        .gte("created_at", month_start)
         .execute()
     )
     rows = resp.data or []
@@ -321,14 +337,6 @@ def chunk_documents(documents):
     return splitter.split_documents(documents)
 
 # ================= PREVIEW + INGEST ROUTES (limits enforced) =================
-class PreviewResponse(BaseModel):
-    domain: str
-    discovered_pages: int
-    top_paths: List[str]
-    sample_urls: List[str]
-    allowed_pages_for_plan: int
-    allowed: bool
-
 @app.get("/ingest/preview", response_model=PreviewResponse)
 async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_key)):
     domain = normalize_domain(url) or url
@@ -356,12 +364,6 @@ async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_k
         "allowed": allowed
     }
 
-class IngestURLJSON(BaseModel):
-    url: str
-    include_paths: Optional[List[str]] = None
-    exclude_paths: Optional[List[str]] = None
-    force_limit: Optional[int] = None
-
 @app.post("/ingest/url")
 async def ingest_url(
     data: IngestURLJSON,
@@ -369,19 +371,18 @@ async def ingest_url(
 ):
     limits = get_plan_limits(client_id)
 
-    # ---- enforce monthly uploads cap
+    # monthly uploads cap
     used_uploads = uploads_used_this_period(client_id)
     if used_uploads >= limits["max_uploads_per_period"]:
         raise HTTPException(403, detail=f"Monthly upload quota reached ({used_uploads}/{limits['max_uploads_per_period']}).")
 
-    # discovery to know how many pages exist
+    # discovery
     preview = await ingest_preview(url=data.url, client_id=client_id)
     allowed_max = limits["max_pages_per_crawl"]
     requested_limit = min(preview["discovered_pages"], allowed_max)
     if data.force_limit:
         requested_limit = min(requested_limit, int(data.force_limit))
 
-    # if over per-crawl limit and no subsets, block
     if preview["discovered_pages"] > allowed_max and not data.include_paths:
         raise HTTPException(
             403,
@@ -389,7 +390,7 @@ async def ingest_url(
                    f"Your plan allows {allowed_max} per crawl. Select includePaths or upgrade."
         )
 
-    # ---- enforce monthly website pages cap
+    # monthly website pages cap
     monthly_cap = limits.get("max_website_pages_per_period", 0) or 0
     if monthly_cap > 0:
         used_pages = website_pages_used_this_period(client_id)
@@ -398,7 +399,7 @@ async def ingest_url(
             raise HTTPException(403, detail=f"Monthly website pages quota exceeded ({used_pages}/{monthly_cap}).")
         requested_limit = min(requested_limit, remaining)
 
-    # do the crawl with the final cap
+    # crawl
     pages = firecrawl_crawl(
         data.url,
         limit=requested_limit,
@@ -406,7 +407,7 @@ async def ingest_url(
         exclude_paths=data.exclude_paths
     )
 
-    # transform to docs and chunk (so you can index later)
+    # transform → chunk
     docs = []
     for p in pages:
         md = p.get("markdown") or ""
@@ -422,7 +423,7 @@ async def ingest_url(
     chunks = chunk_documents(docs)
     chunks_count = len(chunks)
 
-    # log event: counts as 1 upload, and consume website_pages_crawled
+    # log usage
     supabase.table("ingestion_events").insert({
         "client_id": client_id,
         "event_type": "url",
@@ -442,12 +443,12 @@ async def ingest_pdf(
 ):
     limits = get_plan_limits(client_id)
 
-    # ---- enforce monthly uploads cap
+    # monthly uploads cap
     used_uploads = uploads_used_this_period(client_id)
     if used_uploads >= limits["max_uploads_per_period"]:
         raise HTTPException(403, detail=f"Monthly upload quota reached ({used_uploads}/{limits['max_uploads_per_period']}).")
 
-    # save temp
+    # temp save
     temp_dir = "./temp"
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{pdf.filename}")
@@ -459,21 +460,21 @@ async def ingest_pdf(
         reader = PdfReader(temp_path)
         page_count = len(reader.pages)
     except Exception:
-        page_count = 9999
+        page_count = 9999  # conservative if counting fails
 
-    # per-file
+    # per-file cap
     if page_count > limits["max_pdf_pages_per_file"]:
         os.remove(temp_path)
         raise HTTPException(403, detail=f"PDF has {page_count} pages; plan allows {limits['max_pdf_pages_per_file']} per file.")
 
-    # monthly PDF quota
+    # monthly pdf quota
     used_pdf_pages = pdf_pages_used_this_period(client_id)
     remaining_pdf = limits["max_pdf_pages_per_period"] - used_pdf_pages
     if remaining_pdf <= 0 or page_count > remaining_pdf:
         os.remove(temp_path)
         raise HTTPException(403, detail=f"Monthly PDF page quota exceeded ({used_pdf_pages}/{limits['max_pdf_pages_per_period']}).")
 
-    # parse with LlamaParse
+    # parse
     try:
         parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
         parsed = parser.load_data(temp_path)
@@ -485,7 +486,7 @@ async def ingest_pdf(
     chunks = chunk_documents(docs)
     chunks_count = len(chunks)
 
-    # log event: counts as 1 upload, and consume pdf_pages
+    # log usage
     supabase.table("ingestion_events").insert({
         "client_id": client_id,
         "event_type": "pdf",
@@ -496,10 +497,7 @@ async def ingest_pdf(
 
     return {"message": "PDF ingested", "chunks_count": chunks_count, "pdf_pages": page_count}
 
-# ================== YOUR EXISTING CHATBOT + LIVE HANDOFF ROUTES (unchanged) ==================
-# (Everything below is exactly as in your current file: /query, /feedback, /live/*)
-# -------------------- KEEPING YOUR ORIGINAL IMPLEMENTATION --------------------
-
+# ================== CHATBOT + LIVE HANDOFF (unchanged) ==================
 def crawl_website(url: str):
     app_fc = FirecrawlApp(api_key=FIRECRAWL_API_KEY)
     crawl_status = app_fc.crawl_url(
@@ -564,7 +562,7 @@ def chatbot_query(client_id: str, question: str):
     answer = llm.invoke(prompt)
     return answer.content
 
-@app.post("/ingest/")  # legacy combined route still here if your old widget uses it
+@app.post("/ingest/")  # legacy combined route
 async def ingest_data(
     client_id: str = Form(...),
     url: Optional[str] = Form(None),
@@ -624,7 +622,27 @@ async def feedback_endpoint(
         print("feedback error:", e)
         return JSONResponse({"error": "Internal server error"}, status_code=500)
 
-# ========== LIVE HANDOFF (unchanged) ==========
+# ========== LIVE HANDOFF ==========
+def mint_visitor_jwt(*, client_id: str, session_id: str, conversation_id: str, ttl_minutes: int = 30) -> str:
+    if not SUPABASE_JWT_SECRET:
+        raise RuntimeError("Missing SUPABASE_JWT_SECRET")
+    now = datetime.datetime.utcnow()
+    sub = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{client_id}:{session_id}"))
+    payload = {
+        "aud": "authenticated",
+        "sub": sub,
+        "exp": now + datetime.timedelta(minutes=ttl_minutes),
+        "iat": now,
+        "role": "authenticated",
+        "actor": "visitor",
+        "client_id": client_id,
+        "session_id": session_id,
+        "conversation_id": conversation_id,
+    }
+    token = jwt.encode(payload, SUPABASE_JWT_SECRET, algorithm="HS256")
+    print("ISSUED VISITOR JWT PAYLOAD:", payload)
+    return token
+
 @app.post("/live/request")
 async def live_request(
     payload: LiveRequestJSON,
