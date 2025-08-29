@@ -66,7 +66,9 @@ app.add_middleware(
     allow_origins=ALLOWED_WIDGET_ORIGINS or [
         "https://rag-cloud-embedding-frontend.vercel.app",
         "https://chatbot-insight-opal.vercel.app",
-        
+        # add localhost here if needed during local dev:
+        # "http://localhost:5173",
+        # "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -337,7 +339,7 @@ def _path_glob_predicate(include_paths: Optional[List[str]], exclude_paths: Opti
 def firecrawl_scrape(url: str) -> Optional[Dict]:
     endpoint = "https://api.firecrawl.dev/v1/scrape"
     headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
-    # formats: only markdown (metadata/links removed)
+    # formats: only markdown (no links/metadata requested)
     payload = {"url": url, "formats": ["markdown"]}
     try:
         print(f"[firecrawl_scrape] POST {endpoint} url={url}")
@@ -353,7 +355,7 @@ def firecrawl_scrape(url: str) -> Optional[Dict]:
         return {
             "url": url,
             "markdown": data.get("markdown") or "",
-            "metadata": data.get("metadata") or {}  # tolerated if Firecrawl returns something
+            "metadata": data.get("metadata") or {}  # tolerate if the API returns it anyway
         }
     except Exception as e:
         print(f"[firecrawl_scrape] exception url={url} err={e}")
@@ -469,6 +471,30 @@ def chunk_documents(documents):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     return splitter.split_documents(documents)
 
+# ================= PINECONE UPSERT =================
+def store_in_pinecone(chunks, client_id: str):
+    print(f"[pinecone] preparing embeddings: n={len(chunks)} namespace={client_id}")
+    texts = [chunk.page_content for chunk in chunks]
+    embeddings = embeddings_model.embed_documents(texts)
+    vectors = []
+    for chunk, embedding in zip(chunks, embeddings):
+        vector_id = str(uuid.uuid4())
+        vectors.append(
+            (
+                vector_id,
+                embedding,
+                {
+                    "client_id": client_id,
+                    "source": str(chunk.metadata.get("source") or ""),
+                    "content": chunk.page_content,
+                    "title": str(chunk.metadata.get("title") or ""),
+                },
+            )
+        )
+    print(f"[pinecone] upserting to index={INDEX_NAME} namespace={client_id} count={len(vectors)}")
+    index.upsert(vectors, namespace=client_id)
+    return len(vectors)
+
 # ================= PREVIEW (uses remaining website credits) =================
 @app.get("/ingest/preview", response_model=PreviewResponse)
 async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_key)):
@@ -559,8 +585,18 @@ async def ingest_url(
             refund_website_credits(client_id, reserved)
             return JSONResponse({"error": "No content extracted"}, status_code=400)
 
+        # chunk + INDEX to Pinecone
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
+        try:
+            print(f"[pinecone] upserting url chunks: client={client_id} namespace={client_id} n_chunks={chunks_count}")
+            vectors_count = store_in_pinecone(chunks, client_id)
+            print(f"[pinecone] upsert done: vectors={vectors_count}")
+        except Exception as e:
+            print(f"[pinecone] upsert failed: {e}")
+            # refund the full reservation since indexing failed
+            refund_website_credits(client_id, reserved)
+            raise HTTPException(status_code=500, detail="Indexing to Pinecone failed")
 
         if actual < reserved:
             refund_website_credits(client_id, reserved - actual)
@@ -640,8 +676,17 @@ async def ingest_pdf(
             refund_pdf_credits(client_id, page_count)
             return JSONResponse({"error": "No content extracted from PDF"}, status_code=400)
 
+        # chunk + INDEX to Pinecone
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
+        try:
+            print(f"[pinecone] upserting pdf chunks: client={client_id} namespace={client_id} n_chunks={chunks_count}")
+            vectors_count = store_in_pinecone(chunks, client_id)
+            print(f"[pinecone] upsert done: vectors={vectors_count}")
+        except Exception as e:
+            print(f"[pinecone] upsert failed: {e}")
+            refund_pdf_credits(client_id, page_count)
+            raise HTTPException(status_code=500, detail="Indexing to Pinecone failed")
 
         supabase.table("ingestion_events").insert({
             "client_id": client_id,
@@ -693,29 +738,15 @@ def chunk_documents_legacy(documents):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     return splitter.split_documents(documents)
 
-def store_in_pinecone(chunks, client_id: str):
-    texts = [chunk.page_content for chunk in chunks]
-    embeddings = embeddings_model.embed_documents(texts)
-    vectors = []
-    for chunk, embedding in zip(chunks, embeddings):
-        vector_id = str(uuid.uuid4())
-        vectors.append(
-            (
-                vector_id,
-                embedding,
-                {
-                    "client_id": client_id,
-                    "source": str(chunk.metadata.get("source") or ""),
-                    "content": chunk.page_content,
-                },
-            )
-        )
-    index.upsert(vectors, namespace=client_id)
-    return len(vectors)
+def store_in_pinecone_legacy(chunks, client_id: str):
+    # kept for legacy /ingest/
+    return store_in_pinecone(chunks, client_id)
 
 def chatbot_query(client_id: str, question: str):
+    print(f"[query] namespace={client_id} q={question!r}")
     query_embedding = embeddings_model.embed_query(question)
     results = index.query(vector=query_embedding, top_k=3, include_metadata=True, namespace=client_id)
+    print(f"[query] pinecone matches={len(results.matches) if hasattr(results, 'matches') else 0}")
     if not results.matches:
         return "I'm sorry, I couldn't find any relevant information."
     context = "\n\n".join([match.metadata.get("content", "") for match in results.matches])
@@ -737,7 +768,7 @@ async def ingest_data(
     if not all_docs:
         return JSONResponse({"error": "No URL or PDF provided"}, status_code=400)
     chunks = chunk_documents_legacy(all_docs)
-    vectors_count = store_in_pinecone(chunks, client_id)
+    vectors_count = store_in_pinecone_legacy(chunks, client_id)
     return {"message": f"Data ingested for client {client_id}", "chunks_count": vectors_count}
 
 @app.post("/query/")
