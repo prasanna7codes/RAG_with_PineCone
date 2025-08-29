@@ -175,14 +175,57 @@ async def get_session_id(x_session_id: str = Header(None, alias="X-Session-Id"))
     return x_session_id
 
 # ================= CREDITS HELPERS (lifetime) =================
+def ensure_credits_row(client_id: str) -> None:
+    """
+    If a client_credits row doesn't exist, create it using the user's plan defaults.
+    Safe to call often.
+    """
+    # already exists?
+    res = (
+        supabase.table("client_credits")
+        .select("client_id")
+        .eq("client_id", client_id)
+        .maybe_single()
+        .execute()
+    )
+    if res.data:
+        return
+
+    # get plan
+    prof = (
+        supabase.table("users_extra")
+        .select("plan")
+        .eq("id", client_id)
+        .maybe_single()
+        .execute()
+    ).data or {"plan": "starter"}
+    plan = prof.get("plan", "starter")
+
+    # get initial credits
+    lim = (
+        supabase.table("plan_limits")
+        .select("initial_website_pages, initial_pdf_pages")
+        .eq("plan", plan)
+        .maybe_single()
+        .execute()
+    ).data or {"initial_website_pages": 0, "initial_pdf_pages": 0}
+
+    supabase.table("client_credits").insert({
+        "client_id": client_id,
+        "website_pages_remaining": int(lim.get("initial_website_pages", 0) or 0),
+        "pdf_pages_remaining": int(lim.get("initial_pdf_pages", 0) or 0),
+    }).execute()
+
 def get_credits_remaining(client_id: str) -> Dict[str, int]:
-    row = (
+    ensure_credits_row(client_id)
+    res = (
         supabase.table("client_credits")
         .select("website_pages_remaining, pdf_pages_remaining")
         .eq("client_id", client_id)
-        .single()
+        .maybe_single()
         .execute()
-    ).data or {}
+    )
+    row = (res.data or {})
     return {
         "website": int(row.get("website_pages_remaining", 0) or 0),
         "pdf": int(row.get("pdf_pages_remaining", 0) or 0),
@@ -305,6 +348,9 @@ def chunk_documents(documents):
 # ================= PREVIEW (uses remaining website credits) =================
 @app.get("/ingest/preview", response_model=PreviewResponse)
 async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_key)):
+    # ensure credits row exists to avoid 500s on new accounts
+    ensure_credits_row(client_id)
+
     domain = normalize_domain(url) or url
     urls = fetch_sitemap_urls(domain)
     if not urls:
@@ -327,7 +373,7 @@ async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_k
         "discovered_pages": len(urls),
         "top_paths": top_paths,
         "sample_urls": urls[:10],
-        "allowed_pages_for_plan": remaining,  # rename in UI later if you want
+        "allowed_pages_for_plan": remaining,
         "allowed": allowed
     }
 
@@ -337,6 +383,9 @@ async def ingest_url(
     data: IngestURLJSON,
     client_id: str = Depends(get_client_id_from_key),
 ):
+    # make sure credits row exists
+    ensure_credits_row(client_id)
+
     # 1) discover & compute how many we *intend* to crawl
     preview = await ingest_preview(url=data.url, client_id=client_id)
     credits = get_credits_remaining(client_id)
@@ -346,9 +395,10 @@ async def ingest_url(
         raise HTTPException(403, detail="No website page credits remaining. Please top up.")
 
     discovered = int(preview["discovered_pages"])
-    # If user selected subsets, Firecrawl will still obey `limit`; we cap by remaining credits
-    intended = min(discovered if not data.force_limit else min(discovered, int(data.force_limit)),
-                   remaining)
+    intended = min(
+        discovered if not data.force_limit else min(discovered, int(data.force_limit)),
+        remaining
+    )
 
     if intended <= 0:
         raise HTTPException(403, detail="Requested 0 pages after applying remaining credits/limit.")
@@ -357,7 +407,6 @@ async def ingest_url(
     reserved = intended
     ok = reserve_website_credits(client_id, reserved)
     if not ok:
-        # someone else might have consumed credits concurrently
         fresh = get_credits_remaining(client_id)["website"]
         raise HTTPException(403, detail=f"Insufficient website credits. Remaining: {fresh}")
 
@@ -382,19 +431,15 @@ async def ingest_url(
             actual += 1
 
         if not docs:
-            # Nothing extracted: refund everything
             refund_website_credits(client_id, reserved)
             return JSONResponse({"error": "No content extracted"}, status_code=400)
 
-        # chunk (indexing to vector store is your choice; here we only enforce credits)
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
 
-        # Refund any unused reservations (Firecrawl returned fewer than reserved)
         if actual < reserved:
             refund_website_credits(client_id, reserved - actual)
 
-        # Log event
         supabase.table("ingestion_events").insert({
             "client_id": client_id,
             "event_type": "url",
@@ -406,8 +451,7 @@ async def ingest_url(
 
         return {"message": "Website ingested", "chunks_count": chunks_count, "used_pages": actual}
 
-    except Exception as e:
-        # On failure refund full reserved
+    except Exception:
         refund_website_credits(client_id, reserved)
         raise
 
@@ -417,6 +461,7 @@ async def ingest_pdf(
     client_id: str = Depends(get_client_id_from_key),
     pdf: UploadFile = File(...),
 ):
+    ensure_credits_row(client_id)
     credits = get_credits_remaining(client_id)
     remaining_pdf = credits["pdf"]
     if remaining_pdf <= 0:
@@ -429,28 +474,22 @@ async def ingest_pdf(
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(pdf.file, f)
 
-    # count pages
     try:
         try:
             reader = PdfReader(temp_path)
             page_count = len(reader.pages)
         except Exception:
-            # If PyPDF2 fails to count, deny rather than over-consume
             raise HTTPException(400, detail="Unable to read PDF pages. Please upload a valid PDF.")
 
         if page_count <= 0:
-            os.remove(temp_path)
             raise HTTPException(400, detail="PDF has 0 pages.")
 
         if page_count > remaining_pdf:
-            os.remove(temp_path)
             raise HTTPException(403, detail=f"Not enough PDF credits. Needed {page_count}, have {remaining_pdf}.")
 
-        # Reserve exactly the number of pages this file needs
         ok = reserve_pdf_credits(client_id, page_count)
         if not ok:
             fresh = get_credits_remaining(client_id)["pdf"]
-            os.remove(temp_path)
             raise HTTPException(403, detail=f"Insufficient PDF credits. Remaining: {fresh}")
 
         # Parse with LlamaParse
@@ -459,22 +498,16 @@ async def ingest_pdf(
             parsed = parser.load_data(temp_path)
             docs = [Document(page_content=d.text, metadata={"source": pdf.filename or ""}) for d in parsed]
         except Exception:
-            # refund on parse failure
             refund_pdf_credits(client_id, page_count)
             raise
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
 
         if not docs:
             refund_pdf_credits(client_id, page_count)
             return JSONResponse({"error": "No content extracted from PDF"}, status_code=400)
 
-        # chunk (index later if you want)
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
 
-        # Log event
         supabase.table("ingestion_events").insert({
             "client_id": client_id,
             "event_type": "pdf",
@@ -485,11 +518,9 @@ async def ingest_pdf(
 
         return {"message": "PDF ingested", "chunks_count": chunks_count, "pdf_pages": page_count}
 
-    except:
-        # defensive: ensure temp removed if we raised before the inner finally
+    finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
-        raise
 
 # ================== CHATBOT + LIVE HANDOFF (unchanged) ==================
 def crawl_website(url: str):
@@ -765,7 +796,6 @@ async def live_history(
         print("live_history error:", e)
         raise HTTPException(status_code=500, detail="Unable to fetch history")
 
-
 # === CREDITS SNAPSHOT (lifetime) ===
 @app.get("/credits")
 async def get_credits(client_id: str = Depends(get_client_id_from_key)):
@@ -773,22 +803,22 @@ async def get_credits(client_id: str = Depends(get_client_id_from_key)):
     Returns the current one-time credits for this client.
     Does NOT mutate anything.
     """
-    # plan (optional, for UI)
+    ensure_credits_row(client_id)
+
     prof = (
         supabase.table("users_extra")
         .select("plan")
         .eq("id", client_id)
-        .single()
+        .maybe_single()
         .execute()
     ).data or {}
     plan = prof.get("plan", "starter")
 
-    # remaining balances
     cc = (
         supabase.table("client_credits")
         .select("website_pages_remaining, pdf_pages_remaining")
         .eq("client_id", client_id)
-        .single()
+        .maybe_single()
         .execute()
     ).data or {"website_pages_remaining": 0, "pdf_pages_remaining": 0}
 
@@ -797,7 +827,6 @@ async def get_credits(client_id: str = Depends(get_client_id_from_key)):
         "website_pages_remaining": int(cc.get("website_pages_remaining", 0) or 0),
         "pdf_pages_remaining": int(cc.get("pdf_pages_remaining", 0) or 0),
     }
-
 
 # === PDF PREVIEW (count pages only; no credits reservation) ===
 @app.post("/ingest/pdf/preview")
@@ -809,15 +838,9 @@ async def ingest_pdf_preview(
     Uploads file temporarily, counts pages, then deletes.
     Does NOT consume credits. Used by dashboard before actual ingest.
     """
-    # fetch remaining credits to inform the UI
-    cc = (
-        supabase.table("client_credits")
-        .select("pdf_pages_remaining")
-        .eq("client_id", client_id)
-        .single()
-        .execute()
-    ).data or {"pdf_pages_remaining": 0}
-    remaining = int(cc.get("pdf_pages_remaining", 0) or 0)
+    ensure_credits_row(client_id)
+    credits = get_credits_remaining(client_id)
+    remaining = credits["pdf"]
 
     temp_dir = "./temp"
     os.makedirs(temp_dir, exist_ok=True)
