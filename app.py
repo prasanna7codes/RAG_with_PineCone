@@ -209,13 +209,14 @@ def ensure_credits_row(client_id: str) -> None:
         )
         exists = bool(res.data and len(res.data) > 0)
         if not exists:
+            print(f"[credits] creating credits row for {client_id}")
             supabase.table("client_credits").upsert({
                 "client_id": client_id,
                 "website_pages_remaining": 0,
                 "pdf_pages_remaining": 0,
             }, on_conflict="client_id").execute()
-    except Exception:
-        # If select failed for any reason, just attempt an upsert anyway.
+    except Exception as e:
+        print(f"[credits] ensure_credits_row select failed, trying upsert anyway: {e}")
         supabase.table("client_credits").upsert({
             "client_id": client_id,
             "website_pages_remaining": 0,
@@ -223,20 +224,25 @@ def ensure_credits_row(client_id: str) -> None:
         }, on_conflict="client_id").execute()
 
 def reserve_website_credits(client_id: str, pages: int) -> bool:
-    # SQL RPC: reserve_website_pages(p_client_id uuid, p_pages int) returns boolean
+    print(f"[credits] reserving website pages: client={client_id} pages={pages}")
     res = supabase.rpc("reserve_website_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
+    print(f"[credits] reserve_website_pages RPC -> {res.data}")
     return bool(res.data)
 
 def refund_website_credits(client_id: str, pages: int) -> None:
     if pages > 0:
+        print(f"[credits] refunding website pages: client={client_id} pages={pages}")
         supabase.rpc("refund_website_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
 
 def reserve_pdf_credits(client_id: str, pages: int) -> bool:
+    print(f"[credits] reserving pdf pages: client={client_id} pages={pages}")
     res = supabase.rpc("reserve_pdf_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
+    print(f"[credits] reserve_pdf_pages RPC -> {res.data}")
     return bool(res.data)
 
 def refund_pdf_credits(client_id: str, pages: int) -> None:
     if pages > 0:
+        print(f"[credits] refunding pdf pages: client={client_id} pages={pages}")
         supabase.rpc("refund_pdf_pages", {"p_client_id": client_id, "p_pages": int(pages)}).execute()
 
 # ================= DISCOVERY (sitemap → Firecrawl map) =================
@@ -247,7 +253,8 @@ def _http_get(url, timeout=15):
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "InsightBot/1.0"})
         if r.ok:
             return r.text
-    except Exception:
+    except Exception as e:
+        print(f"[http_get] error fetching {url}: {e}")
         return None
     return None
 
@@ -274,18 +281,27 @@ def fetch_sitemap_urls(domain_or_url: str, timeout=15) -> list:
     return sorted(urls)
 
 def firecrawl_map(url: str) -> list:
-    # REST map endpoint is fast & cheap to enumerate
     endpoint = "https://api.firecrawl.dev/v1/map"
     headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
     payload = {"url": url}
     try:
+        print(f"[firecrawl_map] POST {endpoint} payload={payload}")
         r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
+        if not r.ok:
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            print(f"[firecrawl_map] error {r.status_code} {body}")
+            return []
         data = r.json()
         urls = data.get("urls") or data.get("data") or []
         host = urlparse(url if "://" in url else f"https://{url}").netloc
-        return [u for u in urls if urlparse(u).netloc == host]
-    except Exception:
+        urls = [u for u in urls if urlparse(u).netloc == host]
+        print(f"[firecrawl_map] mapped={len(urls)}")
+        return urls
+    except Exception as e:
+        print(f"[firecrawl_map] exception: {e}")
         return []
 
 def canonicalize_urls(urls: list) -> list:
@@ -296,12 +312,86 @@ def canonicalize_urls(urls: list) -> list:
         out.add(f"{p.scheme}://{p.netloc}{path}")
     return sorted(out)
 
-# ================= FIRECRAWL CRAWL (REST) =================
+# ======== Fallback helpers (map + scrape with logging) =========
+def _path_glob_predicate(include_paths: Optional[List[str]], exclude_paths: Optional[List[str]]):
+    """
+    Very simple '/*' -> startswith() glob logic.
+    """
+    inc = include_paths or []
+    exc = exclude_paths or []
+
+    def normalize_glob(g: str) -> str:
+        g = g.strip()
+        if g.endswith("*"):
+            g = g[:-1]
+        return g
+
+    inc_norm = [normalize_glob(g) for g in inc]
+    exc_norm = [normalize_glob(g) for g in exc]
+
+    def allowed(url: str) -> bool:
+        p = urlparse(url)
+        path = p.path or "/"
+        if inc_norm:
+            ok = any(path.startswith(prefix) for prefix in inc_norm)
+            if not ok:
+                return False
+        if exc_norm and any(path.startswith(prefix) for prefix in exc_norm):
+            return False
+        return True
+
+    return allowed
+
+def firecrawl_scrape(url: str) -> Optional[Dict]:
+    endpoint = "https://api.firecrawl.dev/v1/scrape"
+    headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
+    payload = {"url": url, "formats": ["markdown", "metadata"]}
+    try:
+        print(f"[firecrawl_scrape] POST {endpoint} url={url}")
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        if not r.ok:
+            try:
+                body = r.json()
+            except Exception:
+                body = r.text
+            print(f"[firecrawl_scrape] error {r.status_code} {body}")
+            return None
+        data = r.json() or {}
+        return {"url": url, "markdown": data.get("markdown") or "", "metadata": data.get("metadata") or {}}
+    except Exception as e:
+        print(f"[firecrawl_scrape] exception url={url} err={e}")
+        return None
+
+def firecrawl_crawl_fallback(start_url: str, *, limit: int,
+                             include_paths: Optional[List[str]] = None,
+                             exclude_paths: Optional[List[str]] = None) -> List[Dict]:
+    start_url = _normalize_url_with_scheme(start_url)
+    host = urlparse(start_url).netloc
+    print(f"[crawl_fallback] start={start_url} limit={limit} include={include_paths} exclude={exclude_paths}")
+
+    mapped = firecrawl_map(start_url)
+    if not mapped:
+        mapped = [start_url]
+
+    mapped = [u for u in mapped if urlparse(u).netloc == host]
+    pred = _path_glob_predicate(include_paths, exclude_paths)
+    filtered = [u for u in mapped if pred(u)]
+    take = filtered[: max(1, int(limit))]
+    print(f"[crawl_fallback] mapped={len(mapped)} filtered={len(filtered)} taking={len(take)}")
+
+    pages = []
+    for u in take:
+        item = firecrawl_scrape(u)
+        if item and (item.get("markdown") or "").strip():
+            pages.append(item)
+    print(f"[crawl_fallback] scraped_ok={len(pages)}")
+    return pages
+
+# ================= FIRECRAWL CRAWL (REST) with logs + fallback =================
 def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=None) -> list:
     endpoint = "https://api.firecrawl.dev/v1/crawl"
     headers = {"Authorization": f"Bearer {FIRECRAWL_API_KEY}", "Content-Type": "application/json"}
 
-    # Normalize + guard limit
     url = _normalize_url_with_scheme(url)
     safe_limit = max(1, int(limit))
     if safe_limit > 2000:
@@ -310,7 +400,7 @@ def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=N
     payload = {
         "url": url,
         "crawlEntireDomain": True,
-        # "sitemap": "include",  # optional; some deployments reject this field
+        # "sitemap": "include",  # optional
         "maxDiscoveryDepth": 4,
         "limit": safe_limit,
         "scrapeOptions": {"formats": ["markdown", "metadata"]},
@@ -320,46 +410,62 @@ def firecrawl_crawl(url: str, *, limit: int, include_paths=None, exclude_paths=N
     if exclude_paths:
         payload["excludePaths"] = exclude_paths
 
-    r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
-    if not r.ok:
-        try:
-            body = r.json()
-        except Exception:
-            body = r.text
-        raise HTTPException(
-            status_code=502,
-            detail=f"Firecrawl crawl start failed: {r.status_code} {body}"
-        )
-
-    data = r.json()
-    job_id = data.get("jobId") or data.get("id")
-    if not job_id:
-        raise HTTPException(status_code=502, detail=f"Firecrawl did not return job id: {data}")
-
-    status_ep = f"{endpoint}/{job_id}"
-    pages = []
-
-    import time
-    for _ in range(120):  # ~4 minutes
-        s = requests.get(status_ep, headers=headers, timeout=30)
-        if not s.ok:
+    try:
+        print(f"[firecrawl_crawl] start POST {endpoint} payload={payload}")
+        r = requests.post(endpoint, headers=headers, json=payload, timeout=60)
+        if not r.ok:
             try:
-                body = s.json()
+                body = r.json()
             except Exception:
-                body = s.text
-            raise HTTPException(status_code=502, detail=f"Firecrawl status error: {s.status_code} {body}")
+                body = r.text
+            print(f"[firecrawl_crawl] start failed {r.status_code} {body} -> fallback")
+            return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                            include_paths=include_paths, exclude_paths=exclude_paths)
 
-        body = s.json()
-        state = body.get("status") or body.get("state")
-        if state in ("completed", "finished", "succeeded"):
-            pages = body.get("data") or body.get("pages") or []
-            break
-        if state in ("failed", "error"):
-            raise HTTPException(status_code=502, detail=f"Firecrawl crawl failed: {body}")
+        data = r.json()
+        job_id = data.get("jobId") or data.get("id")
+        if not job_id:
+            print(f"[firecrawl_crawl] missing job id: {data} -> fallback")
+            return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                            include_paths=include_paths, exclude_paths=exclude_paths)
 
-        time.sleep(2)
+        status_ep = f"{endpoint}/{job_id}"
+        print(f"[firecrawl_crawl] job_id={job_id} polling {status_ep}")
 
-    return pages
+        import time
+        for i in range(120):  # ~4 minutes
+            s = requests.get(status_ep, headers=headers, timeout=30)
+            if not s.ok:
+                try:
+                    body = s.json()
+                except Exception:
+                    body = s.text
+                print(f"[firecrawl_crawl] status error {s.status_code} {body} -> fallback")
+                return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                                include_paths=include_paths, exclude_paths=exclude_paths)
+
+            body = s.json()
+            state = body.get("status") or body.get("state")
+            print(f"[firecrawl_crawl] poll#{i} state={state}")
+            if state in ("completed", "finished", "succeeded"):
+                pages = body.get("data") or body.get("pages") or []
+                print(f"[firecrawl_crawl] completed pages={len(pages)}")
+                return pages
+            if state in ("failed", "error"):
+                print(f"[firecrawl_crawl] job failed: {body} -> fallback")
+                return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                                include_paths=include_paths, exclude_paths=exclude_paths)
+
+            time.sleep(2)
+
+        print("[firecrawl_crawl] timeout -> fallback")
+        return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                        include_paths=include_paths, exclude_paths=exclude_paths)
+
+    except Exception as e:
+        print(f"[firecrawl_crawl] exception {e} -> fallback")
+        return firecrawl_crawl_fallback(url, limit=safe_limit,
+                                        include_paths=include_paths, exclude_paths=exclude_paths)
 
 # ================= CHUNKING =================
 def chunk_documents(documents):
@@ -369,7 +475,6 @@ def chunk_documents(documents):
 # ================= PREVIEW (uses remaining website credits) =================
 @app.get("/ingest/preview", response_model=PreviewResponse)
 async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_key)):
-    # Make sure the credits row exists so .single() below never 404s
     ensure_credits_row(client_id)
 
     domain = normalize_domain(url) or url
@@ -394,7 +499,7 @@ async def ingest_preview(url: str, client_id: str = Depends(get_client_id_from_k
         "discovered_pages": len(urls),
         "top_paths": top_paths,
         "sample_urls": urls[:10],
-        "allowed_pages_for_plan": remaining,  # rename in UI later if you want
+        "allowed_pages_for_plan": remaining,
         "allowed": allowed
     }
 
@@ -426,10 +531,9 @@ async def ingest_url(
         raise HTTPException(403, detail="Requested 0 pages after applying remaining credits/limit.")
 
     # 2) reserve credits atomically
-    reserved = max(1, intended)  # guard
+    reserved = max(1, intended)
     ok = reserve_website_credits(client_id, reserved)
     if not ok:
-        # someone else might have consumed credits concurrently
         fresh = get_credits_remaining(client_id)["website"]
         raise HTTPException(403, detail=f"Insufficient website credits. Remaining: {fresh}")
 
@@ -454,19 +558,15 @@ async def ingest_url(
             actual += 1
 
         if not docs:
-            # Nothing extracted: refund everything
             refund_website_credits(client_id, reserved)
             return JSONResponse({"error": "No content extracted"}, status_code=400)
 
-        # chunk (indexing to vector store is your choice; here we only enforce credits)
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
 
-        # Refund any unused reservations (Firecrawl returned fewer than reserved)
         if actual < reserved:
             refund_website_credits(client_id, reserved - actual)
 
-        # Log event
         supabase.table("ingestion_events").insert({
             "client_id": client_id,
             "event_type": "url",
@@ -479,12 +579,11 @@ async def ingest_url(
         return {"message": "Website ingested", "chunks_count": chunks_count, "used_pages": actual}
 
     except HTTPException:
-        # bubble up known http errors (already meaningful)
         refund_website_credits(client_id, reserved)
         raise
     except Exception as e:
-        # On failure refund full reserved
         refund_website_credits(client_id, reserved)
+        print(f"[ingest_url] exception: {e}")
         raise
 
 # ================= INGEST PDF (lifetime credits) =================
@@ -500,20 +599,17 @@ async def ingest_pdf(
     if remaining_pdf <= 0:
         raise HTTPException(403, detail="No PDF page credits remaining. Please top up.")
 
-    # temp save to count pages
     temp_dir = "./temp"
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{pdf.filename}")
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(pdf.file, f)
 
-    # count pages
     try:
         try:
             reader = PdfReader(temp_path)
             page_count = len(reader.pages)
         except Exception:
-            # If PyPDF2 fails to count, deny rather than over-consume
             raise HTTPException(400, detail="Unable to read PDF pages. Please upload a valid PDF.")
 
         if page_count <= 0:
@@ -524,21 +620,19 @@ async def ingest_pdf(
             os.remove(temp_path)
             raise HTTPException(403, detail=f"Not enough PDF credits. Needed {page_count}, have {remaining_pdf}.")
 
-        # Reserve exactly the number of pages this file needs
         ok = reserve_pdf_credits(client_id, page_count)
         if not ok:
             fresh = get_credits_remaining(client_id)["pdf"]
             os.remove(temp_path)
             raise HTTPException(403, detail=f"Insufficient PDF credits. Remaining: {fresh}")
 
-        # Parse with LlamaParse
         try:
             parser = LlamaParse(api_key=LLAMA_API_KEY, result_type="markdown")
             parsed = parser.load_data(temp_path)
             docs = [Document(page_content=d.text, metadata={"source": pdf.filename or ""}) for d in parsed]
-        except Exception:
-            # refund on parse failure
+        except Exception as e:
             refund_pdf_credits(client_id, page_count)
+            print(f"[ingest_pdf] llama_parse exception: {e}")
             raise
         finally:
             if os.path.exists(temp_path):
@@ -548,11 +642,9 @@ async def ingest_pdf(
             refund_pdf_credits(client_id, page_count)
             return JSONResponse({"error": "No content extracted from PDF"}, status_code=400)
 
-        # chunk (index later if you want)
         chunks = chunk_documents(docs)
         chunks_count = len(chunks)
 
-        # Log event
         supabase.table("ingestion_events").insert({
             "client_id": client_id,
             "event_type": "pdf",
@@ -564,7 +656,6 @@ async def ingest_pdf(
         return {"message": "PDF ingested", "chunks_count": chunks_count, "pdf_pages": page_count}
 
     except:
-        # defensive: ensure temp removed if we raised before the inner finally
         if os.path.exists(temp_path):
             os.remove(temp_path)
         raise
@@ -852,7 +943,6 @@ async def get_credits(client_id: str = Depends(get_client_id_from_key)):
     """
     ensure_credits_row(client_id)
 
-    # plan (optional, for UI)
     prof = (
         supabase.table("users_extra")
         .select("plan")
@@ -862,7 +952,6 @@ async def get_credits(client_id: str = Depends(get_client_id_from_key)):
     ).data or {}
     plan = prof.get("plan", "starter")
 
-    # remaining balances
     cc = (
         supabase.table("client_credits")
         .select("website_pages_remaining, pdf_pages_remaining")
@@ -889,7 +978,6 @@ async def ingest_pdf_preview(
     """
     ensure_credits_row(client_id)
 
-    # fetch remaining credits to inform the UI
     cc = (
         supabase.table("client_credits")
         .select("pdf_pages_remaining")
@@ -911,7 +999,7 @@ async def ingest_pdf_preview(
             reader = PdfReader(temp_path)
             page_count = len(reader.pages)
         except Exception:
-            page_count = 0  # unreadable PDFs show 0 and allowed=False
+            page_count = 0
 
     finally:
         if os.path.exists(temp_path):
