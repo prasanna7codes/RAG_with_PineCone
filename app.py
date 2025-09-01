@@ -32,9 +32,10 @@ import jwt
 
 
 #new imports for voice
-
+import io
 import openai
-from elevenlabs.client import ElevenLabs
+
+from elevenlabs import ElevenLabs, play
 from fastapi.responses import StreamingResponse
 
 # ================= CONFIG =================
@@ -61,7 +62,9 @@ ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
 ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 
 openai.api_key = OPENAI_API_KEY
-eleven_client = ElevenLabs(api_key=ELEVEN_API_KEY)
+
+
+client = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -1079,12 +1082,16 @@ async def speech_to_text(file: UploadFile = File(...)):
 @app.get("/tts")
 async def text_to_speech(text: str):
     try:
-        audio = eleven_client.generate(
-            voice=ELEVEN_VOICE_ID,
-            model="eleven_multilingual_v2",
+        response = client.text_to_speech.convert(
+            voice_id=ELEVEN_VOICE_ID,
+            model_id="eleven_multilingual_v2",
             text=text
         )
-        return StreamingResponse(io.BytesIO(audio), media_type="audio/mpeg")
+
+        import io
+        audio_bytes = b"".join(response)  # response is a generator
+        return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
+
     except Exception as e:
         print("TTS error:", e)
         raise HTTPException(status_code=500, detail="Text-to-speech failed")
