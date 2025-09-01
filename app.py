@@ -28,6 +28,15 @@ from supabase import Client, create_client
 import resend
 import jwt
 
+
+
+
+#new imports for voice
+
+import openai
+from elevenlabs.client import ElevenLabs
+from fastapi.responses import StreamingResponse
+
 # ================= CONFIG =================
 load_dotenv()
 
@@ -45,6 +54,14 @@ resend.api_key        = os.getenv("RESEND_API_KEY")
 ALLOWED_WIDGET_ORIGINS = [
     o.strip() for o in (os.getenv("ALLOWED_WIDGET_ORIGINS") or "").split(",") if o.strip()
 ]
+
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
+
+openai.api_key = OPENAI_API_KEY
+eleven_client = ElevenLabs(api_key=ELEVEN_API_KEY)
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -1032,3 +1049,42 @@ async def ingest_pdf_preview(
         "pdf_pages_remaining": remaining,
         "allowed": page_count > 0 and page_count <= remaining,
     }
+
+
+# ================= SPEECH TO TEXT (Whisper) =================
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    try:
+        temp_dir = "./temp"
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        with open(temp_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+
+        os.remove(temp_path)
+        return {"text": transcript.text}
+    except Exception as e:
+        print("STT error:", e)
+        raise HTTPException(status_code=500, detail="Speech-to-text failed")
+
+
+# ================= TEXT TO SPEECH (ElevenLabs) =================
+@app.get("/tts")
+async def text_to_speech(text: str):
+    try:
+        audio = eleven_client.generate(
+            voice=ELEVEN_VOICE_ID,
+            model="eleven_multilingual_v2",
+            text=text
+        )
+        return StreamingResponse(io.BytesIO(audio), media_type="audio/mpeg")
+    except Exception as e:
+        print("TTS error:", e)
+        raise HTTPException(status_code=500, detail="Text-to-speech failed")

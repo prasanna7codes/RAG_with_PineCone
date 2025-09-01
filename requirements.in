@@ -16,3 +16,6 @@ resend
 PyJWT
 requests
 PyPDF2
+openai 
+elevenlabs
+
