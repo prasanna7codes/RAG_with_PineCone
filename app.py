@@ -63,6 +63,9 @@ ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 
 openai.api_key = OPENAI_API_KEY
 
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+
+
 
 client = ElevenLabs(api_key=ELEVEN_API_KEY)
 
@@ -1055,27 +1058,39 @@ async def ingest_pdf_preview(
 
 
 # ================= SPEECH TO TEXT (Whisper) =================
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
+
 @app.post("/stt")
 async def speech_to_text(file: UploadFile = File(...)):
     try:
-        temp_dir = "./temp"
-        os.makedirs(temp_dir, exist_ok=True)
-        temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
+        # Read uploaded audio
+        audio_bytes = await file.read()
 
-        with open(temp_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Call Deepgram API
+        response = requests.post(
+            "https://api.deepgram.com/v1/listen",
+            headers={
+                "Authorization": f"Token {DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/webm",  # adjust based on what frontend sends
+            },
+            data=audio_bytes,
+        )
 
-        with open(temp_path, "rb") as audio_file:
-            transcript = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
+        if response.status_code != 200:
+            print("Deepgram error:", response.text)
+            raise HTTPException(status_code=500, detail="Speech-to-text failed")
 
-        os.remove(temp_path)
-        return {"text": transcript.text}
+        result = response.json()
+        # Extract transcript
+        transcript = result.get("results", {}).get("channels", [{}])[0] \
+                          .get("alternatives", [{}])[0] \
+                          .get("transcript", "")
+
+        return {"text": transcript or ""}
     except Exception as e:
         print("STT error:", e)
         raise HTTPException(status_code=500, detail="Speech-to-text failed")
+
 
 
 # ================= TEXT TO SPEECH (ElevenLabs) =================
