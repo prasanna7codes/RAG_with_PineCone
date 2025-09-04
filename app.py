@@ -78,7 +78,7 @@ embeddings_model = GoogleGenerativeAIEmbeddings(
     model="models/text-embedding-004",
     google_api_key=GEMINI_API_KEY
 )
-llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", google_api_key=GEMINI_API_KEY)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY)
 
 # ================= APP ===================
 app = FastAPI(title="SaaS Chatbot + Live Handoff + Lifetime Credits")
