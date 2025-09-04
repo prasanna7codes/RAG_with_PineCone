@@ -16,6 +16,8 @@ resend
 PyJWT
 requests
 PyPDF2
-openai 
-elevenlabs
+
+
+google-cloud-texttospeech
+google-cloud-speech
 

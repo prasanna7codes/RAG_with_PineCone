@@ -33,10 +33,11 @@ import jwt
 
 #new imports for voice
 import io
-import openai
 
-from elevenlabs import ElevenLabs, play
+
 from fastapi.responses import StreamingResponse
+
+from google.cloud import texttospeech
 
 # ================= CONFIG =================
 load_dotenv()
@@ -57,17 +58,15 @@ ALLOWED_WIDGET_ORIGINS = [
 ]
 
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
-ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")
 
-openai.api_key = OPENAI_API_KEY
+
+
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
 
 
-client = ElevenLabs(api_key=ELEVEN_API_KEY)
+
 
 # ================= INIT CLIENTS =================
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -1057,10 +1056,10 @@ async def ingest_pdf_preview(
     }
 
 
-# ================= SPEECH TO TEXT (Whisper) =================
+# ================= SPEECH TO TEXT  =================
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-@app.post("/stt")
+@app.post("/stt-2")
 async def speech_to_text(file: UploadFile = File(...)):
     try:
         # Read uploaded audio
@@ -1090,23 +1089,78 @@ async def speech_to_text(file: UploadFile = File(...)):
     except Exception as e:
         print("STT error:", e)
         raise HTTPException(status_code=500, detail="Speech-to-text failed")
+    
+
+from google.cloud import speech
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    try:
+        # Read uploaded audio 
+        audio_bytes = await file.read()
+
+        # Create Google Speech client
+        client = speech.SpeechClient()
+
+        # Configure audio and recognition
+        audio = speech.RecognitionAudio(content=audio_bytes)
+
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.WEBM_OPUS,  # matches frontend
+            sample_rate_hertz=48000,  # adjust to your recorder settings
+            language_code="en-US",    # change if needed (hi-IN, en-GB, etc.)
+            enable_automatic_punctuation=True,
+        )
+
+        # Send request
+        response = client.recognize(config=config, audio=audio)
+
+        transcript = ""
+        for result in response.results:
+            transcript += result.alternatives[0].transcript
+
+        return {"text": transcript.strip()}
+
+    except Exception as e:
+        print("Google STT error:", e)
+        raise HTTPException(status_code=500, detail="Speech-to-text failed")
 
 
 
-# ================= TEXT TO SPEECH (ElevenLabs) =================
+
+
+    
+# ================= TEXT TO SPEECH (Google Cloud TTS) =================
 @app.get("/tts")
 async def text_to_speech(text: str):
     try:
-        response = client.text_to_speech.convert(
-            voice_id=ELEVEN_VOICE_ID,
-            model_id="eleven_multilingual_v2",
-            text=text
+        # Create client
+        client = texttospeech.TextToSpeechClient()
+
+        # Set text input
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+
+        # Configure voice (you can customize language and voice name)
+        voice = texttospeech.VoiceSelectionParams(
+            language_code="en-US",  # e.g., "en-GB", "hi-IN"
+            name="en-US-Neural2-F",  # optional, pick a neural voice
+            ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
         )
 
-        import io
-        audio_bytes = b"".join(response)  # response is a generator
-        return StreamingResponse(io.BytesIO(audio_bytes), media_type="audio/mpeg")
+        # Configure audio output
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=1.25,   # 1.0 = normal, >1.0 = faster, <1.0 = slower
+            pitch=0.0             # optional: adjust pitch, e.g., +2.0 or -2.0
+        )
+
+        # Request speech synthesis
+        response = client.synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+
+        return StreamingResponse(io.BytesIO(response.audio_content), media_type="audio/mpeg")
 
     except Exception as e:
-        print("TTS error:", e)
-        raise HTTPException(status_code=500, detail="Text-to-speech failed")
+        print("Google TTS error:", e)
+        raise HTTPException(status_code=500, detail="Text-to-speech failed")    

@@ -21,3 +21,8 @@ Thumbs.db
 
 safe.txt
 NIPS-2017-attention-is-all-you-need-Paper.pdf
+
+
+gcloud-key.json
+gcloud-key.json.json
+*.json
