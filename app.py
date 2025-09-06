@@ -1132,26 +1132,44 @@ async def speech_to_text(file: UploadFile = File(...)):
     
 # ================= TEXT TO SPEECH (Google Cloud TTS) =================
 @app.get("/tts")
-async def text_to_speech(text: str):
+async def text_to_speech(text: str, use_ssml: bool = False):
     try:
         # Create client
         client = texttospeech.TextToSpeechClient()
 
-        # Set text input
-        synthesis_input = texttospeech.SynthesisInput(text=text)
+        # If use_ssml is true, wrap text in a simple SSML template to add micro-pauses and prosody.
+        if use_ssml:
+            # IMPORTANT: if 'text' comes from untrusted input, escape XML characters.
+            safe_text = (
+                text.replace("&", "&amp;")
+                    .replace("<", "&lt;")
+                    .replace(">", "&gt;")
+            )
+            ssml = f"""
+            <speak>
+              <voice name="en-US-Neural2-F">
+                <prosody rate="1.02" pitch="0st">
+                  {safe_text}
+                </prosody>
+              </voice>
+            </speak>
+            """
+            synthesis_input = texttospeech.SynthesisInput(ssml=ssml)
+        else:
+            synthesis_input = texttospeech.SynthesisInput(text=text)
 
         # Configure voice (you can customize language and voice name)
         voice = texttospeech.VoiceSelectionParams(
-            language_code="en-US",  # e.g., "en-GB", "hi-IN"
-            name="en-US-Neural2-F",  # optional, pick a neural voice
+            language_code="en-US",
+            name="en-US-Neural2-F",
             ssml_gender=texttospeech.SsmlVoiceGender.FEMALE,
         )
 
         # Configure audio output
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=1.25,   # 1.0 = normal, >1.0 = faster, <1.0 = slower
-            pitch=0.0             # optional: adjust pitch, e.g., +2.0 or -2.0
+            speaking_rate=1.0,
+            pitch=0.0
         )
 
         # Request speech synthesis
@@ -1163,4 +1181,4 @@ async def text_to_speech(text: str):
 
     except Exception as e:
         print("Google TTS error:", e)
-        raise HTTPException(status_code=500, detail="Text-to-speech failed")    
+        raise HTTPException(status_code=500, detail="Text-to-speech failed")
